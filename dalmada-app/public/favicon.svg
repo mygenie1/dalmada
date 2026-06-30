@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#1F4E6B"/>
+  <text x="256" y="300" font-family="-apple-system, 'Apple SD Gothic Neo', sans-serif" font-size="230" font-weight="800" fill="#FBF7EF" text-anchor="middle" letter-spacing="-8">달</text>
+  <circle cx="380" cy="150" r="26" fill="#5BA68B"/>
+</svg>
