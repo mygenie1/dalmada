@@ -1,5 +1,11 @@
 import { useState, useMemo, useEffect } from "react";
 
+// 색상 상수 — 모듈 전역에서 쓰이므로 최상단에 선언(중간의 O 스타일 객체가
+// 초기화 시점에 참조하기 때문에, 아래쪽에 두면 TDZ ReferenceError로 흰 화면이 됨)
+const INK = "#2B2620";
+const PAPER = "#FBF7EF";
+const ACCENT = "#1F4E6B";
+
 // ─────────────────────────────────────────────────────────────
 // 달마다 — 매달 빠지는 돈, 한눈에 잡다.
 // 고정비(메인) + 가계부(보조). 핵심 결과물은 "이번 달 남은 돈".
@@ -2215,10 +2221,6 @@ function buildCycle(cycle, day, weekday, everyN, unit) {
 }
 
 // ─────────────────────────────────────────────────────────────
-const INK = "#2B2620";
-const PAPER = "#FBF7EF";
-const ACCENT = "#1F4E6B";
-
 const KEYFRAMES = `
 @keyframes flow { 0%{transform:translateX(-100%)} 100%{transform:translateX(100%)} }
 @keyframes pop { 0%{transform:scale(.96);opacity:0} 100%{transform:scale(1);opacity:1} }
