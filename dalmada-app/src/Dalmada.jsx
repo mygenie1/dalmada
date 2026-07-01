@@ -992,7 +992,7 @@ function Dashboard({ fixed, byCat, monthTotal, onEdit }) {
                 <div key={c.key} style={S.legendRow}>
                   <span style={{ ...S.legendDot, background: c.color }} />
                   <span style={S.legendLabel}>{c.label}</span>
-                  <span style={S.legendVal}>{Math.round((c.value / monthTotal) * 100)}%</span>
+                  <span style={S.legendVal}>{monthTotal > 0 ? Math.round((c.value / monthTotal) * 100) : 0}%</span>
                 </div>
               ))}
           </div>
