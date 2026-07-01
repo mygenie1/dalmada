@@ -174,27 +174,17 @@ const today = new Date();
 const D = today.getDate();
 const todayISO = today.toISOString().slice(0, 10);
 
-const SEED_FIXED = [
-  { id: 1, name: "월세", amount: 550000, cycle: "monthly", day: 25, cat: "housing" },
-  { id: 2, name: "휴대폰 요금", amount: 55000, cycle: "monthly", day: 14, cat: "comm" },
-  { id: 3, name: "넷플릭스", amount: 13500, cycle: "monthly", day: 5, cat: "sub" },
-  { id: 4, name: "실손보험", amount: 42000, cycle: "monthly", day: 17, cat: "insurance" },
-  { id: 5, name: "자동차보험", amount: 720000, cycle: "yearly", day: 3, cat: "insurance", hideInCalendar: true },
-];
+// 변동 항목이 특정 연·월(기본: 이번 달)에 속하는지. date 없으면 이번 달로 간주(구 데이터 호환).
+function inMonth(item, y = today.getFullYear(), m1 = today.getMonth() + 1) {
+  if (!item.date) return y === today.getFullYear() && m1 === today.getMonth() + 1;
+  const [iy, im] = item.date.split("-").map(Number);
+  return iy === y && im === m1;
+}
 
-const SEED_VAR = [
-  { id: 101, name: "점심", amount: 9000, cat: "food", day: Math.max(1, D - 1) },
-  { id: 102, name: "아메리카노", amount: 4500, cat: "cafe", day: D },
-  { id: 103, name: "지하철", amount: 2800, cat: "transport", day: D },
-];
-
-const SEED_INCOME = [
-  { id: 201, name: "월급", amount: 2800000, cycle: "monthly", day: 25, cat: "salary" },
-];
-
-const SEED_VAR_INCOME = [
-  { id: 301, name: "옷장 정리 중고판매", amount: 45000, cat: "resale", day: Math.max(1, D - 2) },
-];
+const SEED_FIXED = [];
+const SEED_VAR = [];
+const SEED_INCOME = [];
+const SEED_VAR_INCOME = [];
 
 // 자산 분류 (예금은 현금성에 통합)
 const ASSET_CATS = [
@@ -208,35 +198,18 @@ const assetCatOf = (k) => ASSET_CATS.find((c) => c.key === k) || ASSET_CATS[3];
 // 저축/투자 이동 대상 (적금·투자·기타 — 현금성으로의 '저축'은 의미 없으므로 제외)
 const SAVE_TARGETS = ASSET_CATS.filter((c) => c.key !== "cash");
 
-// 시작 자산: 분류별 잔액
-const SEED_ASSETS = { cash: 1800000, savings: 2400000, invest: 800000, etc: 0 };
+// 시작 자산: 분류별 잔액 (신규 = 0, 온보딩에서 입력)
+const SEED_ASSETS = { cash: 0, savings: 0, invest: 0, etc: 0 };
 
-// 고정 저축 (매달 자동 납입) — 적금처럼
-const SEED_FIXED_SAVE = [
-  { id: 501, name: "주택청약", amount: 100000, day: 25, target: "savings" },
-];
-// 수시 저축 (그때그때)
+const SEED_FIXED_SAVE = [];
 const SEED_VAR_SAVE = [];
 
-
-// 지난 달들의 마감 기록. net = 그 달 (수입-지출). alloc = 자산별 배분.
 const _now = new Date();
 function monthLabel(offset) {
   const dt = new Date(_now.getFullYear(), _now.getMonth() - offset, 1);
   return `${dt.getFullYear()}.${String(dt.getMonth() + 1).padStart(2, "0")}`;
 }
-const SEED_HISTORY = [
-  // net = income-fixed-variable-saved, alloc 합계 = net (정확히 일치)
-  { ym: monthLabel(5), income: 2845000, fixed: 720500, variable: 1310000, saved: 200000, alloc: { cash: 514500, savings: 0, invest: 100000, etc: 0 } },
-  { ym: monthLabel(4), income: 2800000, fixed: 720500, variable: 1620000, saved: 100000, alloc: { cash: 359500, savings: 0, invest: 0, etc: 0 } },
-  { ym: monthLabel(3), income: 3120000, fixed: 720500, variable: 1180000, saved: 300000, alloc: { cash: 619500, savings: 0, invest: 300000, etc: 0 } },
-  { ym: monthLabel(2), income: 2800000, fixed: 720500, variable: 1450000, saved: 100000, alloc: { cash: 529500, savings: 0, invest: 0, etc: 0 } },
-  { ym: monthLabel(1), income: 2980000, fixed: 720500, variable: 1390000, saved: 200000, alloc: { cash: 569500, savings: 0, invest: 100000, etc: 0 } },
-].map((m, i) => ({
-  id: 400 + i,
-  ...m,
-  net: m.income - m.fixed - m.variable - m.saved, // 쓸 수 있는 돈 중 남은 것
-}));
+const SEED_HISTORY = [];
 
 // ── 기기 저장 (localStorage). 외부 서버·회원가입 없이 이 기기에만 보관 ──
 const STORE_KEY = "dalmada:v1";
@@ -258,6 +231,7 @@ function loadState() {
       fixedSave: d.fixedSave ?? SEED_FIXED_SAVE,
       varSave: d.varSave ?? SEED_VAR_SAVE,
       lastYM: d.lastYM ?? null,
+      onboarded: d.onboarded ?? true, // 기존 사용자는 온보딩 건너뜀
     };
   } catch {
     return null; // 미리보기 등 localStorage 미지원 환경
@@ -283,6 +257,7 @@ export default function Dalmada() {
   const [fixedSave, setFixedSave] = useState(saved?.fixedSave ?? SEED_FIXED_SAVE);
   const [varSave, setVarSave] = useState(saved?.varSave ?? SEED_VAR_SAVE);
   const [lastYM, setLastYM] = useState(saved?.lastYM ?? null);
+  const [onboarded, setOnboarded] = useState(saved ? saved.onboarded : false);
   const [tab, setTab] = useState("dash");
   const [heroView, setHeroView] = useState(saved?.heroView ?? "month"); // month | year
   const [editing, setEditing] = useState(null); // { type, item } — item 있으면 수정
@@ -295,8 +270,8 @@ export default function Dalmada() {
 
   // 데이터가 바뀔 때마다 기기에 저장
   useEffect(() => {
-    saveState({ fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM });
-  }, [fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM]);
+    saveState({ fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM, onboarded });
+  }, [fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM, onboarded]);
 
   const NY = today.getFullYear();
   const NM = today.getMonth();
@@ -315,7 +290,7 @@ export default function Dalmada() {
   );
 
   const varTotal = useMemo(
-    () => variable.reduce((s, i) => s + i.amount, 0),
+    () => variable.filter((i) => inMonth(i)).reduce((s, i) => s + i.amount, 0),
     [variable]
   );
 
@@ -325,7 +300,7 @@ export default function Dalmada() {
     [income, NY, NM]
   );
   const varIncomeTotal = useMemo(
-    () => varIncome.reduce((s, i) => s + i.amount, 0),
+    () => varIncome.filter((i) => inMonth(i)).reduce((s, i) => s + i.amount, 0),
     [varIncome]
   );
   const incomeTotal = fixedIncomeTotal + varIncomeTotal;
@@ -336,7 +311,7 @@ export default function Dalmada() {
     [fixedSave, NY, NM]
   );
   const varSaveTotal = useMemo(
-    () => varSave.reduce((s, i) => s + i.amount, 0),
+    () => varSave.filter((i) => inMonth(i)).reduce((s, i) => s + i.amount, 0),
     [varSave]
   );
   const saveTotal = fixedSaveTotal + varSaveTotal;
@@ -345,7 +320,7 @@ export default function Dalmada() {
   const saveByTarget = useMemo(() => {
     const m = {};
     fixedSave.forEach((i) => { const a = amountForMonth(i, NY, NM); if (a) m[i.target] = (m[i.target] || 0) + a; });
-    varSave.forEach((i) => { m[i.target] = (m[i.target] || 0) + i.amount; });
+    varSave.filter((i) => inMonth(i)).forEach((i) => { m[i.target] = (m[i.target] || 0) + i.amount; });
     return m;
   }, [fixedSave, varSave, NY, NM]);
 
@@ -541,6 +516,20 @@ export default function Dalmada() {
     setLastYM(curYM);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 온보딩 완료: 입력받은 초기값을 반영
+  const finishOnboarding = ({ assets: a, salary, salaryDay, fixedItems }) => {
+    if (a) setAssets(a);
+    if (salary > 0) setIncome([{ id: Date.now(), name: "월급", amount: salary, cycle: "monthly", day: salaryDay, cat: "salary" }]);
+    if (fixedItems && fixedItems.length) {
+      setFixed(fixedItems.map((f, k) => ({ id: Date.now() + k + 1, name: f.name, amount: f.amount, cycle: "monthly", day: f.day, cat: f.cat })));
+    }
+    setOnboarded(true);
+  };
+
+  if (!onboarded) {
+    return <Onboarding onDone={finishOnboarding} onSkip={() => setOnboarded(true)} />;
+  }
 
   return (
     <div style={S.app}>
@@ -739,6 +728,137 @@ export default function Dalmada() {
     </div>
   );
 }
+
+// ─────────────────────────────────────────────────────────────
+// 온보딩: 첫 실행 시 시작 자산·월급·고정비를 간단히 입력받음
+// ─────────────────────────────────────────────────────────────
+function Onboarding({ onDone, onSkip }) {
+  const [step, setStep] = useState(0);
+  // 자산
+  const [cash, setCash] = useState("");
+  const [savings, setSavings] = useState("");
+  const [invest, setInvest] = useState("");
+  // 월급
+  const [salary, setSalary] = useState("");
+  const [salaryDay, setSalaryDay] = useState("25");
+  // 고정비 (동적)
+  const [items, setItems] = useState([{ name: "", amount: "", day: "1", cat: "housing" }]);
+
+  const addItemRow = () => setItems((p) => [...p, { name: "", amount: "", day: "1", cat: "housing" }]);
+  const setItem = (idx, key, v) => setItems((p) => p.map((it, i) => i === idx ? { ...it, [key]: v } : it));
+  const removeItemRow = (idx) => setItems((p) => p.filter((_, i) => i !== idx));
+
+  const finish = () => {
+    onDone({
+      assets: { cash: Number(cash) || 0, savings: Number(savings) || 0, invest: Number(invest) || 0, etc: 0 },
+      salary: Number(salary) || 0,
+      salaryDay: Number(salaryDay) || 25,
+      fixedItems: items
+        .filter((f) => f.name.trim() && Number(f.amount) > 0)
+        .map((f) => ({ name: f.name.trim(), amount: Number(f.amount), day: Number(f.day) || 1, cat: f.cat })),
+    });
+  };
+
+  return (
+    <div style={O.wrap}>
+      <style>{`*{box-sizing:border-box}button{font-family:inherit;cursor:pointer}input:focus{outline:none;border-color:#1F4E6B}`}</style>
+
+      <div style={O.top}>
+        <div style={O.brand}>달마다<span style={{ color: ACCENT }}>·</span></div>
+        <button style={O.skip} onClick={onSkip}>건너뛰기</button>
+      </div>
+
+      <div style={O.dots}>
+        {[0, 1, 2].map((i) => <span key={i} style={{ ...O.dot, ...(i === step ? O.dotOn : {}) }} />)}
+      </div>
+
+      <div style={O.body}>
+        {step === 0 && (
+          <>
+            <div style={O.title}>지금 가진 돈부터</div>
+            <div style={O.sub}>통장·적금·투자에 얼마가 있나요? 여기에 매달 남는 돈이 쌓여 총자산이 됩니다. 모르면 비워도 돼요.</div>
+            <Field label="현금성 (통장·현금·예금)"><MoneyInput value={cash} onChange={setCash} big autoFocus /></Field>
+            <Field label="적금·저축"><MoneyInput value={savings} onChange={setSavings} /></Field>
+            <Field label="투자 (주식·펀드 등)"><MoneyInput value={invest} onChange={setInvest} /></Field>
+          </>
+        )}
+
+        {step === 1 && (
+          <>
+            <div style={O.title}>월급은 얼마인가요?</div>
+            <div style={O.sub}>매달 들어오는 고정 수입이에요. 여기서 고정비·지출을 빼면 "쓸 수 있는 돈"이 나옵니다. 없으면 비워도 돼요.</div>
+            <Field label="월급 (원)"><MoneyInput value={salary} onChange={setSalary} big autoFocus /></Field>
+            <Field label="들어오는 날 (매월 며칠)">
+              <input style={S.input} value={salaryDay} inputMode="numeric"
+                onChange={(e) => setSalaryDay(e.target.value.replace(/[^0-9]/g, ""))} />
+            </Field>
+          </>
+        )}
+
+        {step === 2 && (
+          <>
+            <div style={O.title}>매달 나가는 고정비</div>
+            <div style={O.sub}>월세·통신·구독처럼 매달 빠지는 돈이에요. 생각나는 것만 넣으세요. 나중에 얼마든 추가할 수 있어요.</div>
+            {items.map((it, idx) => (
+              <div key={idx} style={O.itemCard}>
+                <div style={O.itemTop}>
+                  <input style={{ ...S.input, flex: 1 }} value={it.name} placeholder="예: 월세"
+                    onChange={(e) => setItem(idx, "name", e.target.value)} />
+                  {items.length > 1 && <button style={O.rm} onClick={() => removeItemRow(idx)}>×</button>}
+                </div>
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <div style={{ flex: 1 }}><MoneyInput value={it.amount} onChange={(v) => setItem(idx, "amount", v)} /></div>
+                  <input style={{ ...S.input, width: 92 }} value={it.day} inputMode="numeric" placeholder="며칠"
+                    onChange={(e) => setItem(idx, "day", e.target.value.replace(/[^0-9]/g, ""))} />
+                </div>
+                <div style={O.catRow}>
+                  {FIXED_CATS.map((c) => (
+                    <button key={c.key} onClick={() => setItem(idx, "cat", c.key)}
+                      style={{ ...O.catChip, ...(it.cat === c.key ? { borderColor: c.color, background: c.color + "18", color: INK } : {}) }}>
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <button style={O.addRow} onClick={addItemRow}>+ 고정비 더 추가</button>
+          </>
+        )}
+      </div>
+
+      <div style={O.footer}>
+        {step < 2 ? (
+          <button style={O.next} onClick={() => setStep(step + 1)}>다음</button>
+        ) : (
+          <button style={O.next} onClick={finish}>시작하기</button>
+        )}
+        {step > 0 && <button style={O.back} onClick={() => setStep(step - 1)}>이전</button>}
+      </div>
+    </div>
+  );
+}
+
+const O = {
+  wrap: { maxWidth: 480, margin: "0 auto", minHeight: "100vh", background: PAPER, color: INK, display: "flex", flexDirection: "column", fontFamily: "-apple-system, BlinkMacSystemFont, 'Pretendard', 'Apple SD Gothic Neo', sans-serif" },
+  top: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "22px 20px 8px" },
+  brand: { fontSize: 22, fontWeight: 800, letterSpacing: "-0.02em" },
+  skip: { background: "none", border: "none", color: "#A39C8F", fontSize: 14, fontWeight: 600 },
+  dots: { display: "flex", gap: 6, justifyContent: "center", padding: "8px 0 4px" },
+  dot: { width: 7, height: 7, borderRadius: 999, background: "#DDD5C5" },
+  dotOn: { background: ACCENT, width: 20 },
+  body: { flex: 1, padding: "24px 20px", overflowY: "auto" },
+  title: { fontSize: 24, fontWeight: 800, letterSpacing: "-0.03em", marginBottom: 8 },
+  sub: { fontSize: 13.5, color: "#8A8479", lineHeight: 1.6, marginBottom: 24 },
+  itemCard: { background: "#fff", borderRadius: 14, border: "1px solid #EFE9DD", padding: 14, marginBottom: 10 },
+  itemTop: { display: "flex", alignItems: "center", gap: 8 },
+  rm: { background: "none", border: "none", color: "#C9C2B4", fontSize: 22, lineHeight: 1, padding: "0 4px" },
+  catRow: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 },
+  catChip: { background: "#fff", border: "1px solid #E4DCCC", borderRadius: 999, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, color: "#8A8479" },
+  addRow: { width: "100%", background: "#F2EEE2", border: "none", borderRadius: 12, padding: "12px 0", fontSize: 13.5, fontWeight: 600, color: "#7A7468" },
+  footer: { padding: "12px 20px 26px", borderTop: "1px solid #EFE9DD" },
+  next: { width: "100%", background: INK, color: PAPER, border: "none", borderRadius: 13, padding: "15px 0", fontSize: 15.5, fontWeight: 700 },
+  back: { width: "100%", background: "none", border: "none", color: "#A39C8F", padding: "12px 0 0", fontSize: 14 },
+};
 
 // ─────────────────────────────────────────────────────────────
 // 들어온 돈 / 나가는 돈 → 종류 선택 시트
@@ -1401,11 +1521,11 @@ function CalendarView({ fixed, income, fixedSave, variable, varIncome, varSave, 
       if (!i.hideInCalendar && occursOn(i, ym.y, ym.m, d, daysInMonth))
         out.save.push({ ...i, amount: amountIn(i, ym.y, ym.m), kind: "고정저축", type: "fixedSave" });
     });
-    if (isThisMonth) {
-      varIncome.forEach((i) => { if (Math.min(i.day, daysInMonth) === d) out.income.push({ ...i, kind: "변동수입", type: "varIncome" }); });
-      variable.forEach((i) => { if (Math.min(i.day, daysInMonth) === d) out.expense.push({ ...i, kind: "변동비", type: "var" }); });
-      varSave.forEach((i) => { if (Math.min(i.day, daysInMonth) === d) out.save.push({ ...i, kind: "수시저축", type: "varSave" }); });
-    }
+    // 변동 항목: 그 항목의 날짜가 이 달력 월(ym)에 속하면 표시
+    const inThisCalMonth = (i) => inMonth(i, ym.y, ym.m + 1);
+    varIncome.forEach((i) => { if (inThisCalMonth(i) && Math.min(i.day, daysInMonth) === d) out.income.push({ ...i, kind: "변동수입", type: "varIncome" }); });
+    variable.forEach((i) => { if (inThisCalMonth(i) && Math.min(i.day, daysInMonth) === d) out.expense.push({ ...i, kind: "변동비", type: "var" }); });
+    varSave.forEach((i) => { if (inThisCalMonth(i) && Math.min(i.day, daysInMonth) === d) out.save.push({ ...i, kind: "수시저축", type: "varSave" }); });
     return out;
   };
 
@@ -1538,16 +1658,56 @@ function FormFooter({ valid, onSave, onDelete }) {
 }
 
 // 기간 설정 (시작월~종료월). 비우면 무기한.
-function PeriodField({ startYM, setStartYM, endYM, setEndYM }) {
-  const fmt = (v) => v.replace(/[^0-9.]/g, "");
+// 전체 날짜(YYYY-MM-DD) 선택. 지난 달·다음 달도 지정 가능.
+function DateField({ date, setDate, label = "날짜" }) {
   return (
-    <Field label="기간 (선택 · YYYY.MM, 비우면 계속)">
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <input style={S.input} value={startYM} onChange={(e) => setStartYM(fmt(e.target.value))} placeholder="시작 (예: 2024.03)" inputMode="numeric" />
-        <span style={{ color: "#9A958B" }}>~</span>
-        <input style={S.input} value={endYM} onChange={(e) => setEndYM(fmt(e.target.value))} placeholder="종료 (만기)" inputMode="numeric" />
-      </div>
+    <Field label={label}>
+      <input type="date" style={{ ...S.input, colorScheme: "light" }}
+        value={date} onChange={(e) => setDate(e.target.value)} />
     </Field>
+  );
+}
+
+// 기존 항목 수정 시 초기 날짜 복원 (date 없으면 이번 달 + day로)
+function initialDate(initial) {
+  if (initial?.date) return initial.date;
+  const d = initial?.day || D;
+  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+// 저장용: date와 파생된 day를 함께
+function dateFields(date) {
+  const dd = date ? Number(date.split("-")[2]) : D;
+  return { date, day: dd };
+}
+// 선택 날짜가 이번 달이 아니면 안내
+function PastDateNote({ date }) {
+  if (!date) return null;
+  const [y, m] = date.split("-").map(Number);
+  const isThis = y === today.getFullYear() && m === today.getMonth() + 1;
+  if (isThis) return null;
+  const past = new Date(y, m - 1) < new Date(today.getFullYear(), today.getMonth());
+  return (
+    <div style={S.pastNote}>
+      {past ? "지난" : "다음"} 달({y}.{String(m).padStart(2, "0")}) 날짜예요. 이번 달 계산에는 포함되지 않고, 달력의 해당 월에서 볼 수 있어요.
+    </div>
+  );
+}
+
+function PeriodField({ startYM, setStartYM, endYM, setEndYM }) {
+  // 내부 저장은 "YYYY.MM", <input type=month>는 "YYYY-MM"
+  const toInput = (v) => (v ? v.replace(".", "-") : "");
+  const fromInput = (v) => (v ? v.replace("-", ".") : "");
+  return (
+    <>
+      <div style={S.fieldLabel}>기간 (선택 · 비우면 계속)</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        <input type="month" style={{ ...S.input, colorScheme: "light" }}
+          value={toInput(startYM)} onChange={(e) => setStartYM(fromInput(e.target.value))} />
+        <span style={{ color: "#9A958B" }}>~</span>
+        <input type="month" style={{ ...S.input, colorScheme: "light" }}
+          value={toInput(endYM)} onChange={(e) => setEndYM(fromInput(e.target.value))} />
+      </div>
+    </>
   );
 }
 
@@ -1632,8 +1792,8 @@ function VarForm({ initial, onSave, onDelete, onClose }) {
   const [amount, setAmount] = useState(initial ? String(initial.amount) : "");
   const [cat, setCat] = useState(initial?.cat || "food");
   const [name, setName] = useState(initial?.name || "");
-  const [day, setDay] = useState(String(initial?.day || D));
-  const valid = Number(amount) > 0 && Number(day) >= 1 && Number(day) <= 31;
+  const [date, setDate] = useState(initialDate(initial));
+  const valid = Number(amount) > 0 && !!date;
 
   return (
     <Sheet title={initial ? "지출 수정" : "지출 기록"} onClose={onClose}>
@@ -1642,15 +1802,13 @@ function VarForm({ initial, onSave, onDelete, onClose }) {
       </Field>
       <div style={S.fieldLabel}>분류</div>
       <CatGrid cats={VAR_CATS} value={cat} onChange={setCat} />
-      <Field label="날짜 (며칠)">
-        <input style={S.input} value={day} inputMode="numeric"
-          onChange={(e) => setDay(e.target.value.replace(/[^0-9]/g, ""))} />
-      </Field>
+      <DateField date={date} setDate={setDate} />
+      <PastDateNote date={date} />
       <Field label="메모 (선택)">
         <input style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 점심, 택시" />
       </Field>
       <FormFooter valid={valid} onDelete={onDelete}
-        onSave={() => valid && onSave({ amount: Number(amount), cat, name: name.trim(), day: Number(day) })} />
+        onSave={() => valid && onSave({ amount: Number(amount), cat, name: name.trim(), ...dateFields(date) })} />
       <button style={S.cancel} onClick={onClose}>닫기</button>
     </Sheet>
   );
@@ -1699,26 +1857,24 @@ function VarIncomeForm({ initial, onSave, onDelete, onClose }) {
   const [amount, setAmount] = useState(initial ? String(initial.amount) : "");
   const [cat, setCat] = useState(initial?.cat || "resale");
   const [name, setName] = useState(initial?.name || "");
-  const [day, setDay] = useState(String(initial?.day || D));
-  const valid = Number(amount) > 0 && Number(day) >= 1 && Number(day) <= 31;
+  const [date, setDate] = useState(initialDate(initial));
+  const valid = Number(amount) > 0 && !!date;
 
   return (
     <Sheet title={initial ? "들어온 돈 수정" : "들어온 돈 기록"} onClose={onClose}>
-      <div style={S.tip}>중고판매·환급·용돈처럼 이번 달에 들어온 일회성 수입을 기록하세요.</div>
+      <div style={S.tip}>중고판매·환급·용돈처럼 들어온 일회성 수입을 기록하세요.</div>
       <Field label="금액">
         <MoneyInput value={amount} onChange={setAmount} big autoFocus />
       </Field>
       <div style={S.fieldLabel}>분류</div>
       <CatGrid cats={VAR_INCOME_CATS} value={cat} onChange={setCat} />
-      <Field label="날짜 (며칠)">
-        <input style={S.input} value={day} inputMode="numeric"
-          onChange={(e) => setDay(e.target.value.replace(/[^0-9]/g, ""))} />
-      </Field>
+      <DateField date={date} setDate={setDate} />
+      <PastDateNote date={date} />
       <Field label="메모 (선택)">
         <input style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 중고 거래, 카드 캐시백" />
       </Field>
       <FormFooter valid={valid} onDelete={onDelete}
-        onSave={() => valid && onSave({ amount: Number(amount), cat, name: name.trim(), day: Number(day) })} />
+        onSave={() => valid && onSave({ amount: Number(amount), cat, name: name.trim(), ...dateFields(date) })} />
       <button style={S.cancel} onClick={onClose}>닫기</button>
     </Sheet>
   );
@@ -1767,8 +1923,8 @@ function VarSaveForm({ initial, onSave, onDelete, onClose }) {
   const [amount, setAmount] = useState(initial ? String(initial.amount) : "");
   const [target, setTarget] = useState(initial?.target || "savings");
   const [name, setName] = useState(initial?.name || "");
-  const [day, setDay] = useState(String(initial?.day || D));
-  const valid = Number(amount) > 0 && Number(day) >= 1 && Number(day) <= 31;
+  const [date, setDate] = useState(initialDate(initial));
+  const valid = Number(amount) > 0 && !!date;
 
   return (
     <Sheet title={initial ? "저축 수정" : "저축하기"} onClose={onClose}>
@@ -1778,15 +1934,13 @@ function VarSaveForm({ initial, onSave, onDelete, onClose }) {
       </Field>
       <div style={S.fieldLabel}>어느 자산으로?</div>
       <CatGrid cats={SAVE_TARGETS} value={target} onChange={setTarget} />
-      <Field label="날짜 (며칠)">
-        <input style={S.input} value={day} inputMode="numeric"
-          onChange={(e) => setDay(e.target.value.replace(/[^0-9]/g, ""))} />
-      </Field>
+      <DateField date={date} setDate={setDate} />
+      <PastDateNote date={date} />
       <Field label="메모 (선택)">
         <input style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 보너스 일부 적금" />
       </Field>
       <FormFooter valid={valid} onDelete={onDelete}
-        onSave={() => valid && onSave({ amount: Number(amount), target, name: name.trim(), day: Number(day) })} />
+        onSave={() => valid && onSave({ amount: Number(amount), target, name: name.trim(), ...dateFields(date) })} />
       <button style={S.cancel} onClick={onClose}>닫기</button>
     </Sheet>
   );
@@ -2144,6 +2298,7 @@ const S = {
 
   main: { padding: "18px 16px 0" },
   tip: { background: "#F2EEE2", borderRadius: 12, padding: "11px 14px", fontSize: 12.5, color: "#6B655B", lineHeight: 1.5, marginBottom: 14 },
+  pastNote: { background: "#FBF3E7", borderRadius: 10, padding: "9px 12px", fontSize: 12, color: "#A8763C", lineHeight: 1.5, marginTop: -6, marginBottom: 14 },
   searchWrap: { display: "flex", alignItems: "center", gap: 8, background: "#fff", border: "1px solid #E4DCCC", borderRadius: 12, padding: "0 12px", marginBottom: 14 },
   searchIcon: { fontSize: 18, color: "#A39C8F" },
   searchInput: { flex: 1, border: "none", outline: "none", background: "none", padding: "12px 0", fontSize: 15, color: INK },
