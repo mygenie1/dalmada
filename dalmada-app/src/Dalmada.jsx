@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 
 // 색상 상수 — 모듈 전역에서 쓰이므로 최상단에 선언(중간의 O 스타일 객체가
 // 초기화 시점에 참조하기 때문에, 아래쪽에 두면 TDZ ReferenceError로 흰 화면이 됨)
@@ -141,16 +141,28 @@ function amountForMonth(item, y, m0) {
   return item.amount * count;
 }
 
+// "YYYY-MM-DD" → 로컬 자정 Date. new Date("YYYY-MM-DD")는 UTC로 해석돼
+// 시간대에 따라 하루 밀리므로 직접 파싱한다.
+function parseISO(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+const pad2 = (n) => String(n).padStart(2, "0");
+const isoOf = (dt) => `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+
 // 특정 날짜(y, m0, d)에 이 반복 항목이 발생하는지
 function occursOn(item, y, m0, d, daysInMonth) {
   if (!inPeriod(item, y, m0)) return false; // 기간 밖
   if (isSkipped(item, y, m0)) return false; // 이 달 건너뛰기
   const date = new Date(y, m0, d);
   switch (item.cycle) {
-    case "weekly":
+    case "weekly": {
+      // anchor(첫 발생일)가 있으면 그 날부터. 없으면(구 데이터) 제한 없이 매주.
+      if (item.anchor && date < parseISO(item.anchor)) return false;
       return date.getDay() === (item.weekday ?? 0);
+    }
     case "custom": {
-      const anchor = item.anchor ? new Date(item.anchor) : new Date(y, m0, item.day || 1);
+      const anchor = item.anchor ? parseISO(item.anchor) : new Date(y, m0, item.day || 1);
       const { everyN = 1, unit = "month" } = item;
       if (date < anchor) return false;
       if (unit === "day") {
@@ -176,9 +188,28 @@ function occursOn(item, y, m0, d, daysInMonth) {
   }
 }
 
+// 이번 달 아직 남은 반복 항목들의 "다음 발생일" 목록. 고정비 탭의 '다가올 결제일'과
+// 대시보드의 '다가올 큰 지출'이 같은 값을 쓴다(계산 중복 금지).
+// occursOn/amountIn을 그대로 재사용하므로 기간·예외·스킵이 자동 반영된다.
+function upcomingIn(groups, y, m0, fromDay) {
+  const daysInMonth = new Date(y, m0 + 1, 0).getDate();
+  const out = [];
+  groups.forEach(({ items, kind, type }) => {
+    items.forEach((i) => {
+      for (let d = Math.max(1, fromDay); d <= daysInMonth; d++) {
+        if (occursOn(i, y, m0, d, daysInMonth)) {
+          out.push({ key: `${type}-${i.id}`, day: d, item: i, amount: amountIn(i, y, m0), kind, type });
+          break; // 이 달의 첫 발생만
+        }
+      }
+    });
+  });
+  return out.sort((a, b) => a.day - b.day || b.amount - a.amount);
+}
+
 const today = new Date();
 const D = today.getDate();
-const todayISO = today.toISOString().slice(0, 10);
+const todayISO = isoOf(today); // toISOString()은 UTC라 KST 새벽에 하루 밀림
 
 // 변동 항목이 특정 연·월(기본: 이번 달)에 속하는지. date 없으면 이번 달로 간주(구 데이터 호환).
 function inMonth(item, y = today.getFullYear(), m1 = today.getMonth() + 1) {
@@ -220,25 +251,41 @@ const SEED_HISTORY = [];
 // ── 기기 저장 (localStorage). 외부 서버·회원가입 없이 이 기기에만 보관 ──
 const STORE_KEY = "dalmada:v1";
 
+// 저장본(또는 백업 파일)을 앱 상태로 정규화. 없는 필드는 기본값으로 채워 하위호환.
+// loadState와 가져오기(import)가 함께 쓴다 — 기본값은 여기 한 곳에만 둔다.
+function normalizeState(d) {
+  return {
+    fixed: d.fixed ?? SEED_FIXED,
+    variable: d.variable ?? SEED_VAR,
+    income: d.income ?? SEED_INCOME,
+    varIncome: d.varIncome ?? SEED_VAR_INCOME,
+    heroView: d.heroView ?? "month",
+    history: d.history ?? SEED_HISTORY,
+    assets: { ...SEED_ASSETS, ...(d.assets ?? {}) },
+    fixedSave: d.fixedSave ?? SEED_FIXED_SAVE,
+    varSave: d.varSave ?? SEED_VAR_SAVE,
+    lastYM: d.lastYM ?? null,
+    onboarded: d.onboarded ?? true, // 기존 사용자는 온보딩 건너뜀
+  };
+}
+
+// 백업 파일이 이 앱의 데이터인지 확인. 항목 배열들이 실제로 배열이어야 한다.
+const STATE_ARRAYS = ["fixed", "variable", "income", "varIncome", "history", "fixedSave", "varSave"];
+function isValidBackup(d) {
+  if (!d || typeof d !== "object" || Array.isArray(d)) return false;
+  const known = STATE_ARRAYS.filter((k) => k in d);
+  if (known.length === 0) return false; // 우리 파일이 아님
+  if (known.some((k) => !Array.isArray(d[k]))) return false;
+  if ("assets" in d && (typeof d.assets !== "object" || d.assets === null || Array.isArray(d.assets))) return false;
+  return true;
+}
+
 // 저장된 데이터를 한 번에 읽음. 없거나 막혀 있으면 시드로 시작.
 function loadState() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return null;
-    const d = JSON.parse(raw);
-    return {
-      fixed: d.fixed ?? SEED_FIXED,
-      variable: d.variable ?? SEED_VAR,
-      income: d.income ?? SEED_INCOME,
-      varIncome: d.varIncome ?? SEED_VAR_INCOME,
-      heroView: d.heroView ?? "month",
-      history: d.history ?? SEED_HISTORY,
-      assets: d.assets ?? SEED_ASSETS,
-      fixedSave: d.fixedSave ?? SEED_FIXED_SAVE,
-      varSave: d.varSave ?? SEED_VAR_SAVE,
-      lastYM: d.lastYM ?? null,
-      onboarded: d.onboarded ?? true, // 기존 사용자는 온보딩 건너뜀
-    };
+    return normalizeState(JSON.parse(raw));
   } catch {
     return null; // 미리보기 등 localStorage 미지원 환경
   }
@@ -274,9 +321,13 @@ export default function Dalmada() {
   const openAdd = (type) => setEditing({ type, item: null });
   const openEdit = (type, item) => setEditing({ type, item });
 
+  // 기기에 저장되는 전체 상태 객체. 내보내기도 이걸 그대로 직렬화하므로
+  // 나중에 상태 필드가 늘어나도 여기만 고치면 저장·백업이 함께 따라온다.
+  const stateObj = { fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM, onboarded };
+
   // 데이터가 바뀔 때마다 기기에 저장
   useEffect(() => {
-    saveState({ fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM, onboarded });
+    saveState(stateObj);
   }, [fixed, variable, income, varIncome, heroView, history, assets, fixedSave, varSave, lastYM, onboarded]);
 
   const NY = today.getFullYear();
@@ -366,6 +417,22 @@ export default function Dalmada() {
       (c) => c.value > 0
     );
   }, [fixed]);
+
+  // 이번 달 아직 안 빠진 고정비·고정저축 (오늘 포함). 고정비 탭과 대시보드가 공유.
+  const upcoming = useMemo(
+    () => upcomingIn(
+      [
+        { items: fixed, kind: "고정비", type: "fixed" },
+        { items: fixedSave, kind: "고정저축", type: "fixedSave" },
+      ],
+      NY, NM, D
+    ),
+    [fixed, fixedSave, NY, NM]
+  );
+
+  // 대시보드 빈 상태 판정: 아직 아무것도 기록하지 않은 사용자
+  const isEmptyMonth = fixed.length + income.length + fixedSave.length
+    + variable.length + varIncome.length + varSave.length === 0;
 
   // type → setter / 날짜 보정 매핑
   const SETTERS = {
@@ -460,6 +527,61 @@ export default function Dalmada() {
     setLastYM(`${_now.getFullYear()}.${String(_now.getMonth() + 1).padStart(2, "0")}`);
     setShowCloseForm(false);
     setTab("asset");
+  };
+
+  // 내보내기: 기기에 저장되는 객체를 그대로 JSON 파일로 (외부 라이브러리 없이 Blob + <a download>)
+  const handleExport = () => {
+    try {
+      const blob = new Blob([JSON.stringify(stateObj, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `dalmada-backup-${isoOf(new Date())}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      window.alert("파일을 만들지 못했어요. 다른 브라우저에서 시도해보세요.");
+    }
+  };
+
+  // 가져오기: 파일을 검증한 뒤 상태·localStorage에 반영. 기존 데이터는 덮어씀.
+  const handleImport = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => window.alert("파일을 읽지 못했어요.");
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(String(reader.result));
+      } catch {
+        window.alert("JSON 파일이 아니거나 내용이 손상됐어요.");
+        return;
+      }
+      if (!isValidBackup(parsed)) {
+        window.alert("달마다 백업 파일이 아니에요. 내보내기로 만든 파일을 골라주세요.");
+        return;
+      }
+      if (!window.confirm("지금 이 기기의 데이터를 모두 지우고 백업 파일로 덮어씁니다. 계속할까요?")) return;
+
+      const d = normalizeState(parsed);
+      setFixed(d.fixed);
+      setVariable(d.variable);
+      setIncome(d.income);
+      setVarIncome(d.varIncome);
+      setHeroView(d.heroView);
+      setHistory(d.history);
+      setAssets(d.assets);
+      setFixedSave(d.fixedSave);
+      setVarSave(d.varSave);
+      setLastYM(d.lastYM);
+      setOnboarded(d.onboarded);
+      saveState(d); // 저장 useEffect를 기다리지 않고 즉시 반영
+      setTab("dash");
+      window.alert("불러왔어요. 백업 시점의 기록으로 돌아갑니다.");
+    };
+    reader.readAsText(file);
   };
 
   const handleReset = () => {
@@ -560,8 +682,8 @@ export default function Dalmada() {
         </div>
       </header>
 
-      {/* 고정비 히어로 (대시보드/캘린더) — 기본 월 단위, 토글로 연 단위 */}
-      {tab !== "month" && (
+      {/* 고정비 히어로 (고정비 탭 전용) — 기본 월 단위, 토글로 연 단위 */}
+      {tab === "fixed" && (
         <section style={S.hero}>
           <div style={S.heroTopRow}>
             <div style={S.heroLabel}>
@@ -606,8 +728,9 @@ export default function Dalmada() {
         </section>
       )}
 
-      {/* 이번 달 히어로 = 쓸 수 있는 돈 (수입 - 고정비 - 변동비 - 저축) */}
-      {tab === "month" && (
+      {/* 이번 달 히어로 = 쓸 수 있는 돈 (수입 - 고정비 - 변동비 - 저축).
+          대시보드(요약 홈)와 이번 달 탭이 같은 컴포넌트를 공유한다. */}
+      {(tab === "month" || (tab === "dash" && !isEmptyMonth)) && (
         <RemainHero
           incomeTotal={incomeTotal}
           monthTotal={monthTotal}
@@ -618,7 +741,8 @@ export default function Dalmada() {
 
       <nav style={S.tabs}>
         {[
-          ["dash", "대시보드"],
+          ["dash", "홈"],
+          ["fixed", "고정비"],
           ["month", "이번 달"],
           ["calendar", "달력"],
           ["asset", "총자산"],
@@ -635,7 +759,31 @@ export default function Dalmada() {
 
       <main style={S.main}>
         {tab === "dash" && (
-          <Dashboard fixed={fixed} byCat={byCat} monthTotal={monthTotal} onEdit={(item) => openEdit("fixed", item)} />
+          <Dashboard
+            incomeTotal={incomeTotal}
+            monthTotal={monthTotal}
+            varTotal={varTotal}
+            saveTotal={saveTotal}
+            thisMonthNet={thisMonthNet}
+            history={history}
+            upcoming={upcoming}
+            isEmpty={isEmptyMonth}
+            onEdit={openEdit}
+            onAdd={openAdd}
+            onGoTab={setTab}
+          />
+        )}
+        {tab === "fixed" && (
+          <FixedTab
+            fixed={fixed}
+            income={income}
+            fixedSave={fixedSave}
+            byCat={byCat}
+            monthTotal={monthTotal}
+            upcoming={upcoming}
+            onEdit={openEdit}
+            onAdd={openAdd}
+          />
         )}
         {tab === "calendar" && (
           <CalendarView
@@ -665,6 +813,8 @@ export default function Dalmada() {
             onEdit={openEdit}
             onAdd={openAdd}
             onReset={handleReset}
+            onExport={handleExport}
+            onImport={handleImport}
           />
         )}
         {tab === "asset" && (
@@ -744,13 +894,14 @@ function Onboarding({ onDone, onSkip }) {
   const [cash, setCash] = useState("");
   const [savings, setSavings] = useState("");
   const [invest, setInvest] = useState("");
-  // 월급
+  // 월급 — 날짜는 달력에서 고르고 '일'만 쓴다
   const [salary, setSalary] = useState("");
-  const [salaryDay, setSalaryDay] = useState("25");
+  const [salaryISO, setSalaryISO] = useState(() => isoForDay(25));
+  const salaryDay = Number(salaryISO.slice(8));
   // 고정비 (동적)
-  const [items, setItems] = useState([{ name: "", amount: "", day: "1", cat: "housing" }]);
+  const [items, setItems] = useState([{ name: "", amount: "", iso: isoForDay(1), cat: "housing" }]);
 
-  const addItemRow = () => setItems((p) => [...p, { name: "", amount: "", day: "1", cat: "housing" }]);
+  const addItemRow = () => setItems((p) => [...p, { name: "", amount: "", iso: isoForDay(1), cat: "housing" }]);
   const setItem = (idx, key, v) => setItems((p) => p.map((it, i) => i === idx ? { ...it, [key]: v } : it));
   const removeItemRow = (idx) => setItems((p) => p.filter((_, i) => i !== idx));
 
@@ -758,10 +909,10 @@ function Onboarding({ onDone, onSkip }) {
     onDone({
       assets: { cash: Number(cash) || 0, savings: Number(savings) || 0, invest: Number(invest) || 0, etc: 0 },
       salary: Number(salary) || 0,
-      salaryDay: Number(salaryDay) || 25,
+      salaryDay: salaryDay || 25,
       fixedItems: items
         .filter((f) => f.name.trim() && Number(f.amount) > 0)
-        .map((f) => ({ name: f.name.trim(), amount: Number(f.amount), day: Number(f.day) || 1, cat: f.cat })),
+        .map((f) => ({ name: f.name.trim(), amount: Number(f.amount), day: Number(f.iso.slice(8)) || 1, cat: f.cat })),
     });
   };
 
@@ -794,10 +945,10 @@ function Onboarding({ onDone, onSkip }) {
             <div style={O.title}>월급은 얼마인가요?</div>
             <div style={O.sub}>매달 들어오는 고정 수입이에요. 여기서 고정비·지출을 빼면 "쓸 수 있는 돈"이 나옵니다. 없으면 비워도 돼요.</div>
             <Field label="월급 (원)"><MoneyInput value={salary} onChange={setSalary} big autoFocus /></Field>
-            <Field label="들어오는 날 (매월 며칠)">
-              <input style={S.input} value={salaryDay} inputMode="numeric"
-                onChange={(e) => setSalaryDay(e.target.value.replace(/[^0-9]/g, ""))} />
-            </Field>
+            <div style={S.fieldLabel}>들어오는 날</div>
+            <input type="date" style={{ ...S.input, colorScheme: "light", marginBottom: 6 }}
+              value={salaryISO} onChange={(e) => e.target.value && setSalaryISO(e.target.value)} />
+            <div style={S.fieldHint}>매월 <b>{salaryDay}일</b>에 들어와요. 연·월은 쓰지 않아요.</div>
           </>
         )}
 
@@ -814,9 +965,10 @@ function Onboarding({ onDone, onSkip }) {
                 </div>
                 <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                   <div style={{ flex: 1 }}><MoneyInput value={it.amount} onChange={(v) => setItem(idx, "amount", v)} /></div>
-                  <input style={{ ...S.input, width: 92 }} value={it.day} inputMode="numeric" placeholder="며칠"
-                    onChange={(e) => setItem(idx, "day", e.target.value.replace(/[^0-9]/g, ""))} />
+                  <input type="date" style={{ ...S.input, width: 150, colorScheme: "light" }} value={it.iso}
+                    onChange={(e) => e.target.value && setItem(idx, "iso", e.target.value)} />
                 </div>
+                <div style={{ ...S.fieldHint, marginTop: 6 }}>매월 {Number(it.iso.slice(8))}일에 빠져요</div>
                 <div style={O.catRow}>
                   {FIXED_CATS.map((c) => (
                     <button key={c.key} onClick={() => setItem(idx, "cat", c.key)}
@@ -976,53 +1128,270 @@ function RemainHero({ incomeTotal, monthTotal, varTotal, saveTotal }) {
 // ─────────────────────────────────────────────────────────────
 // 대시보드 (고정비)
 // ─────────────────────────────────────────────────────────────
-function Dashboard({ fixed, byCat, monthTotal, onEdit }) {
-  if (fixed.length === 0)
+// 대시보드 = 이번 달 요약 홈. 위쪽 '쓸 수 있는 돈' 히어로(RemainHero)는 Dalmada가 렌더.
+// 모든 수치는 메인에서 계산된 값을 props로 받는다 (여기서 회계 계산을 하지 않는다).
+function Dashboard({ incomeTotal, monthTotal, varTotal, saveTotal, thisMonthNet, history, upcoming, isEmpty, onEdit, onAdd, onGoTab }) {
+  if (isEmpty) {
+    return (
+      <>
+        <Empty
+          title="이번 달 기록을 시작해보세요"
+          body="월세·통신 같은 고정비를 먼저 넣으면 매달 얼마가 빠지는지 바로 보여요. 오늘 쓴 밥값은 3초면 기록됩니다."
+        />
+        <div style={S.emptyCta}>
+          <button style={S.emptyCtaMain} onClick={() => onAdd("fixed")}>고정비 추가하기</button>
+          <button style={S.emptyCtaSub} onClick={() => onAdd("income")}>월급 등록하기</button>
+          <button style={S.emptyCtaSub} onClick={() => onAdd("var")}>오늘 지출 기록하기</button>
+        </div>
+      </>
+    );
+  }
+
+  // 지난달 대비 지출(고정비+변동비). 마감 기록이 있어야만 비교한다.
+  const prev = history.length ? history[history.length - 1] : null;
+  const prevSpend = prev ? (prev.fixed || 0) + (prev.variable || 0) : 0;
+  const curSpend = monthTotal + varTotal;
+  const diffPct = prev && prevSpend > 0 ? Math.round(((curSpend - prevSpend) / prevSpend) * 100) : null;
+
+  // 최근 남는 돈 추이: 마감된 달들 + 진행 중인 이번 달
+  const trend = [
+    ...history.slice(-5).map((h) => ({ label: `${Number(h.ym.split(".")[1])}월`, net: h.net })),
+    { label: "이번", net: thisMonthNet, current: true },
+  ];
+
+  // 다가올 큰 지출: 아직 안 빠진 고정비 중 금액 큰 순 3개
+  const bigUpcoming = upcoming
+    .filter((u) => u.type === "fixed")
+    .slice()
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, 3);
+
+  const cards = [
+    { label: "수입", value: incomeTotal, color: "#2E8B6B", sign: "+" },
+    { label: "고정비", value: monthTotal, color: ACCENT, sign: "−" },
+    { label: "변동비", value: varTotal, color: "#D98244", sign: "−" },
+    { label: "저축·투자", value: saveTotal, color: "#C98A3B", sign: "→" },
+  ];
+
+  return (
+    <>
+      <div style={S.sumGrid}>
+        {cards.map((c) => (
+          <div key={c.label} style={S.sumCard}>
+            <div style={S.sumCardTop}>
+              <span style={{ ...S.legendDot, background: c.color }} />
+              <span style={S.sumCardLabel}>{c.label}</span>
+            </div>
+            <div style={{ ...S.sumCardVal, color: c.value > 0 ? c.color : "#B9B3A8" }}>
+              {c.value > 0 ? c.sign : ""}{won(c.value)}
+              <span style={S.sumCardUnit}>원</span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {diffPct !== null && (
+        <div style={S.cmpRow}>
+          지난달({prev.ym}) 지출 <b>{won(prevSpend)}원</b>보다{" "}
+          {diffPct === 0 ? (
+            <b>변화 없어요</b>
+          ) : (
+            <b style={{ color: diffPct > 0 ? "#C0566B" : "#2E8B6B" }}>
+              {diffPct > 0 ? "▲" : "▼"} {Math.abs(diffPct)}% {diffPct > 0 ? "더 썼어요" : "덜 썼어요"}
+            </b>
+          )}
+        </div>
+      )}
+
+      {history.length > 0 && (
+        <div style={{ ...S.card, marginTop: 16 }}>
+          <div style={S.cardTitle}>최근 남는 돈 추이</div>
+          <NetTrend points={trend} />
+        </div>
+      )}
+
+      <div style={S.listHead}>
+        <span>다가올 큰 지출</span>
+        <button style={S.quickAdd} onClick={() => onGoTab("fixed")}>고정비 전체 ›</button>
+      </div>
+      {bigUpcoming.length === 0 ? (
+        <div style={S.incomeEmpty} onClick={() => onAdd("fixed")}>
+          이번 달 남은 고정비가 없어요. 탭해서 추가하기
+        </div>
+      ) : (
+        <div style={S.list}>
+          {bigUpcoming.map((u) => {
+            const c = catOf(u.item.cat);
+            return (
+              <ItemRow key={u.key} barColor={c.color} name={u.item.name}
+                meta={<>{u.day}일 · {c.label}</>}
+                amount={`−${won(u.amount)}원`} onClick={() => onEdit(u.type, u.item)} />
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
+// 남는 돈 추이 미니 막대 (0을 기준선으로, 마이너스 달은 아래로)
+function NetTrend({ points }) {
+  const max = Math.max(1, ...points.map((p) => Math.abs(p.net)));
+  return (
+    <div style={S.trendRow}>
+      {points.map((p, i) => {
+        const up = p.net >= 0;
+        const h = (Math.abs(p.net) / max) * 100;
+        return (
+          <div key={i} style={S.trendCol}>
+            <div style={S.trendUpper}>
+              {up && <div style={{ ...S.trendBar, height: `${Math.max(3, h)}%`, background: "#2E8B6B", opacity: p.current ? 1 : 0.5 }} />}
+            </div>
+            <div style={S.trendBase} />
+            <div style={S.trendLower}>
+              {!up && <div style={{ ...S.trendBar, height: `${Math.max(3, h)}%`, background: "#C0566B", opacity: p.current ? 1 : 0.5, alignSelf: "flex-start" }} />}
+            </div>
+            <div style={{ ...S.trendLabel, ...(p.current ? { color: INK, fontWeight: 700 } : {}) }}>{p.label}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// 고정비 탭: 매달 반복되는 항목 전부 (고정수입 · 고정비 · 고정저축)
+// 히어로(월/연 환산 토글)는 Dalmada가 렌더한다.
+// ─────────────────────────────────────────────────────────────
+function FixedTab({ fixed, income, fixedSave, byCat, monthTotal, upcoming, onEdit, onAdd }) {
+  const hasAny = fixed.length + income.length + fixedSave.length > 0;
+  if (!hasAny)
     return (
       <Empty
-        title="아직 고정비가 없어요"
+        title="아직 고정 항목이 없어요"
         body="월세·통신·구독부터 넣어보세요. 1년에 얼마가 빠지는지 바로 보입니다."
       />
     );
+
   return (
     <>
-      <div style={S.card}>
-        <div style={S.cardTitle}>어디로 빠지나</div>
-        <div style={S.donutRow}>
-          <Donut data={byCat} total={monthTotal} center="매월" />
-          <div style={S.legend}>
-            {byCat
-              .slice()
-              .sort((a, b) => b.value - a.value)
-              .map((c) => (
-                <div key={c.key} style={S.legendRow}>
-                  <span style={{ ...S.legendDot, background: c.color }} />
-                  <span style={S.legendLabel}>{c.label}</span>
-                  <span style={S.legendVal}>{monthTotal > 0 ? Math.round((c.value / monthTotal) * 100) : 0}%</span>
-                </div>
-              ))}
+      {fixed.length > 0 && (
+        <div style={S.card}>
+          <div style={S.cardTitle}>어디로 빠지나</div>
+          <div style={S.donutRow}>
+            <Donut data={byCat} total={monthTotal} center="매월" />
+            <div style={S.legend}>
+              {byCat
+                .slice()
+                .sort((a, b) => b.value - a.value)
+                .map((c) => (
+                  <div key={c.key} style={S.legendRow}>
+                    <span style={{ ...S.legendDot, background: c.color }} />
+                    <span style={S.legendLabel}>{c.label}</span>
+                    <span style={S.legendVal}>{monthTotal > 0 ? Math.round((c.value / monthTotal) * 100) : 0}%</span>
+                  </div>
+                ))}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <div style={S.listHead}>
-        <span>고정비 {fixed.length}건</span>
-        <span style={S.listHeadHint}>월 환산 기준</span>
+        <span>다가올 결제일</span>
+        <span style={S.listHeadHint}>이번 달 남은 것</span>
       </div>
-
-      <div style={S.list}>
-        {fixed
-          .slice()
-          .sort((a, b) => monthly(b) - monthly(a))
-          .map((i) => {
-            const c = catOf(i.cat);
+      {upcoming.length === 0 ? (
+        <div style={S.upBox}>
+          <div style={S.upEmpty}>이번 달 남은 결제일이 없어요.</div>
+        </div>
+      ) : (
+        <div style={S.list}>
+          {upcoming.slice(0, 5).map((u) => {
+            const c = u.type === "fixedSave" ? assetCatOf(u.item.target) : catOf(u.item.cat);
             return (
-              <ItemRow key={i.id} barColor={c.color} name={i.name}
-                meta={<>{c.label} · {cycleLabel(i)}{i.cycle === "yearly" && <span style={S.yearTag}>연 {won(i.amount)}원</span>}{i.hideInCalendar && <span style={S.hiddenTag}>달력 숨김</span>}</>}
-                amount={`${won(monthly(i))}원`} onClick={() => onEdit(i)} />
+              <ItemRow key={u.key} barColor={c.color} name={u.item.name}
+                meta={<>{u.day}일 · {u.kind}{u.day === D && <span style={S.todayTag}>오늘</span>}</>}
+                amount={`${u.type === "fixedSave" ? "→" : "−"}${won(u.amount)}원`}
+                amountColor={u.type === "fixedSave" ? c.color : INK}
+                onClick={() => onEdit(u.type, u.item)} />
             );
           })}
+        </div>
+      )}
+
+      {/* 고정수입 */}
+      <div style={S.listHead}>
+        <span>고정수입 {income.length}건</span>
+        <button style={S.quickAdd} onClick={() => onAdd("income")}>+ 고정수입</button>
       </div>
+      {income.length === 0 ? (
+        <div style={S.incomeEmpty} onClick={() => onAdd("income")}>
+          월급처럼 매달 들어오는 돈을 등록하세요. 탭해서 추가하기
+        </div>
+      ) : (
+        <div style={S.list}>
+          {income
+            .slice()
+            .sort((a, b) => monthly(b) - monthly(a))
+            .map((i) => {
+              const c = catOf(i.cat);
+              return (
+                <ItemRow key={i.id} barColor={c.color} name={i.name}
+                  meta={<>{c.label} · {cycleLabel(i)}{i.hideInCalendar && <span style={S.hiddenTag}>달력 숨김</span>}</>}
+                  amount={`+${won(monthly(i))}원`} amountColor="#2E8B6B" onClick={() => onEdit("income", i)} />
+              );
+            })}
+        </div>
+      )}
+
+      {/* 고정비 */}
+      <div style={S.listHead}>
+        <span>고정비 {fixed.length}건</span>
+        <button style={S.quickAdd} onClick={() => onAdd("fixed")}>+ 고정비</button>
+      </div>
+      {fixed.length === 0 ? (
+        <div style={S.incomeEmpty} onClick={() => onAdd("fixed")}>
+          월세·통신·구독처럼 매달 빠지는 돈을 등록하세요. 탭해서 추가하기
+        </div>
+      ) : (
+        <div style={S.list}>
+          {fixed
+            .slice()
+            .sort((a, b) => monthly(b) - monthly(a))
+            .map((i) => {
+              const c = catOf(i.cat);
+              return (
+                <ItemRow key={i.id} barColor={c.color} name={i.name}
+                  meta={<>{c.label} · {cycleLabel(i)}{i.cycle === "yearly" && <span style={S.yearTag}>연 {won(i.amount)}원</span>}{i.hideInCalendar && <span style={S.hiddenTag}>달력 숨김</span>}</>}
+                  amount={`${won(monthly(i))}원`} onClick={() => onEdit("fixed", i)} />
+              );
+            })}
+        </div>
+      )}
+
+      {/* 고정저축 */}
+      <div style={S.listHead}>
+        <span>고정 저축 {fixedSave.length}건</span>
+        <button style={S.quickAdd} onClick={() => onAdd("fixedSave")}>+ 고정 저축</button>
+      </div>
+      {fixedSave.length === 0 ? (
+        <div style={S.incomeEmpty} onClick={() => onAdd("fixedSave")}>
+          주기적으로 빠지는 적금·정기투자를 등록하세요. 탭해서 추가하기
+        </div>
+      ) : (
+        <div style={S.list}>
+          {fixedSave.map((i) => {
+            const t = assetCatOf(i.target);
+            return (
+              <ItemRow key={i.id} barColor={t.color} name={i.name}
+                meta={<>{t.label}으로 · {cycleLabel(i)}{i.hideInCalendar && <span style={S.hiddenTag}>달력 숨김</span>}</>}
+                amount={`→${won(monthly(i))}원`} amountColor={t.color} onClick={() => onEdit("fixedSave", i)} />
+            );
+          })}
+        </div>
+      )}
+
+      <div style={S.storeNote}>금액은 월 환산 기준이에요. 매주·격주 항목도 한 달 평균으로 보여줍니다.</div>
     </>
   );
 }
@@ -1030,8 +1399,9 @@ function Dashboard({ fixed, byCat, monthTotal, onEdit }) {
 // ─────────────────────────────────────────────────────────────
 // 이번 달 (가계부): 수입 + 변동비 도넛 + 변동비 리스트
 // ─────────────────────────────────────────────────────────────
-function MonthView({ income, varIncome, fixed, fixedSave, varSave, fixedIncomeTotal, varIncomeTotal, incomeTotal, monthTotal, variable, varTotal, saveTotal, onEdit, onAdd, onReset }) {
+function MonthView({ income, varIncome, fixed, fixedSave, varSave, fixedIncomeTotal, varIncomeTotal, incomeTotal, monthTotal, variable, varTotal, saveTotal, onEdit, onAdd, onReset, onExport, onImport }) {
   const [q, setQ] = useState("");
+  const fileRef = useRef(null);
   const byVarCat = useMemo(() => {
     const m = {};
     variable.forEach((i) => (m[i.cat] = (m[i.cat] || 0) + i.amount));
@@ -1259,6 +1629,26 @@ function MonthView({ income, varIncome, fixed, fixedSave, varSave, fixedIncomeTo
             })}
         </div>
       )}
+
+      {/* 백업: 기기를 바꾸거나 브라우저 데이터를 지우면 기록이 사라지므로 */}
+      <div style={S.backupHead}>데이터 백업</div>
+      <div style={S.backupRow}>
+        <button style={S.backupBtn} onClick={onExport}>데이터 내보내기</button>
+        <button style={S.backupBtn} onClick={() => fileRef.current?.click()}>데이터 가져오기</button>
+      </div>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          onImport(e.target.files?.[0]);
+          e.target.value = ""; // 같은 파일을 다시 골라도 onChange가 뜨도록
+        }}
+      />
+      <div style={S.storeNote}>
+        내보내기로 JSON 파일을 저장해두면 새 기기·새 브라우저에서 가져오기로 되살릴 수 있어요.
+      </div>
 
       <button style={S.resetBtn} onClick={onReset}>
         모든 데이터 초기화
@@ -1685,6 +2075,39 @@ function dateFields(date) {
   const dd = date ? Number(date.split("-")[2]) : D;
   return { date, day: dd };
 }
+
+// "매월 N일"을 달력으로 고르기 위한 표시용 날짜.
+// 이번 달에 N일이 없으면(예: 31일) N일이 존재하는 가장 가까운 달을 쓴다.
+function isoForDay(day) {
+  const d = Math.min(31, Math.max(1, Number(day) || 1));
+  let y = today.getFullYear(), m = today.getMonth();
+  for (let k = 0; k < 12; k++) {
+    if (new Date(y, m + 1, 0).getDate() >= d) break;
+    m++;
+    if (m > 11) { m = 0; y++; }
+  }
+  return `${y}-${pad2(m + 1)}-${pad2(d)}`;
+}
+// anchor(YYYY-MM-DD) → 비교용 YYYYMM
+const anchorYMNum = (a) => (a ? Number(a.slice(0, 4)) * 100 + Number(a.slice(5, 7)) : null);
+
+// 시작 날짜(anchor) · 유효 기간(startYM~endYM) 조합 검증.
+// { block } 이면 저장을 막고, 아니면 참고용 안내만 띄운다.
+function cycleIssue(cycle, anchor, startYM, endYM) {
+  const s = ymStrToNum(startYM);
+  const e = ymStrToNum(endYM);
+  if (s && e && s > e) return { block: true, text: "유효 기간의 종료월이 시작월보다 빨라요." };
+  if (cycle === "monthly" || !anchor) return null;
+  const a = anchorYMNum(anchor);
+  if (e && a > e) return { block: true, text: "반복 시작 날짜가 유효 기간(종료월)보다 뒤예요. 한 번도 발생하지 않아요." };
+  if (s && a < s) return { block: false, text: "반복 시작 날짜가 유효 기간 시작월보다 앞서요. 실제로는 기간이 시작된 뒤부터 발생해요." };
+  return null;
+}
+function CycleWarn({ issue }) {
+  if (!issue) return null;
+  return <div style={issue.block ? S.errNote : S.pastNote}>{issue.text}</div>;
+}
+
 // 선택 날짜가 이번 달이 아니면 안내
 function PastDateNote({ date }) {
   if (!date) return null;
@@ -1694,25 +2117,28 @@ function PastDateNote({ date }) {
   const past = new Date(y, m - 1) < new Date(today.getFullYear(), today.getMonth());
   return (
     <div style={S.pastNote}>
-      {past ? "지난" : "다음"} 달({y}.{String(m).padStart(2, "0")}) 날짜예요. 이번 달 계산에는 포함되지 않고, 달력의 해당 월에서 볼 수 있어요.
+      {past ? "지난" : "다음"} 달({y}.{pad2(m)}) 날짜예요. 이번 달 <b>쓸 수 있는 돈</b> 계산에는 들어가지 않고, 달력의 {m}월에서 볼 수 있어요.
     </div>
   );
 }
 
+// 유효 기간(만기). 반복이 "언제부터"인지는 CycleField의 시작 날짜(anchor)가 정한다.
+// 여기서는 "이 항목이 살아 있는 달의 범위"만 다루므로 월 단위가 맞다(inPeriod도 YYYYMM 비교).
 function PeriodField({ startYM, setStartYM, endYM, setEndYM }) {
   // 내부 저장은 "YYYY.MM", <input type=month>는 "YYYY-MM"
   const toInput = (v) => (v ? v.replace(".", "-") : "");
   const fromInput = (v) => (v ? v.replace("-", ".") : "");
   return (
     <>
-      <div style={S.fieldLabel}>기간 (선택 · 비우면 계속)</div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+      <div style={S.fieldLabel}>유효 기간 · 만기 (선택 · 비우면 계속)</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
         <input type="month" style={{ ...S.input, colorScheme: "light" }}
           value={toInput(startYM)} onChange={(e) => setStartYM(fromInput(e.target.value))} />
         <span style={{ color: "#9A958B" }}>~</span>
         <input type="month" style={{ ...S.input, colorScheme: "light" }}
           value={toInput(endYM)} onChange={(e) => setEndYM(fromInput(e.target.value))} />
       </div>
+      <div style={S.fieldHint}>이 항목이 유효한 달의 범위예요. 24개월 적금이면 종료월에 만기를 넣으세요.</div>
     </>
   );
 }
@@ -1749,7 +2175,9 @@ function RecurringFooter({ valid, editingItem, onSaveScope, onSkip, onDelete }) 
       <button style={{ ...S.submit, ...(valid ? {} : S.submitOff) }} disabled={!valid} onClick={() => onSaveScope(scope)}>
         저장하기
       </button>
-      <button style={S.skipBtn} onClick={onSkip}>이번 달만 건너뛰기</button>
+      <button style={S.skipBtn} onClick={() => { if (window.confirm("이번 달은 이 항목을 건너뛸까요? 다음 달부터 다시 반복돼요.")) onSkip(); }}>
+        이번 달만 건너뛰기
+      </button>
       <button style={S.deleteBtn} onClick={() => { if (window.confirm("이 항목을 완전히 삭제할까요?")) onDelete(); }}>
         완전히 삭제하기
       </button>
@@ -1767,10 +2195,12 @@ function FixedForm({ initial, onSave, onSkip, onDelete, onClose }) {
   const [unit, setUnit] = useState(initial?.unit || "month");
   const [cat, setCat] = useState(initial?.cat || "housing");
   const [hidden, setHidden] = useState(initial?.hideInCalendar || false);
+  const [anchor, setAnchor] = useState(() => initialAnchor(initial));
   const [startYM, setStartYM] = useState(initial?.startYM || "");
   const [endYM, setEndYM] = useState(initial?.endYM || "");
-  const valid = name.trim() && Number(amount) > 0;
-  const build = () => ({ name: name.trim(), amount: Number(amount), cat, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit) });
+  const issue = cycleIssue(cycle, anchor, startYM, endYM);
+  const valid = !!name.trim() && Number(amount) > 0 && !issue?.block;
+  const build = () => ({ name: name.trim(), amount: Number(amount), cat, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit, anchor) });
 
   return (
     <Sheet title={initial ? "고정비 수정" : "고정비 추가"} onClose={onClose}>
@@ -1780,11 +2210,13 @@ function FixedForm({ initial, onSave, onSkip, onDelete, onClose }) {
       <Field label="금액">
         <MoneyInput value={amount} onChange={setAmount} />
       </Field>
-      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay}
-        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit} />
-      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
       <div style={S.fieldLabel}>분류</div>
       <CatGrid cats={FIXED_CATS} value={cat} onChange={setCat} />
+      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay} dayLabel="매월 결제일"
+        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit}
+        anchor={anchor} setAnchor={setAnchor} />
+      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
+      <CycleWarn issue={issue} />
       <HideToggle hidden={hidden} setHidden={setHidden} />
       <RecurringFooter valid={valid} editingItem={initial}
         onSaveScope={(scope) => valid && onSave(build(), scope)} onSkip={onSkip} onDelete={onDelete} />
@@ -1831,10 +2263,12 @@ function IncomeForm({ initial, onSave, onSkip, onDelete, onClose }) {
   const [unit, setUnit] = useState(initial?.unit || "week");
   const [cat, setCat] = useState(initial?.cat || "salary");
   const [hidden, setHidden] = useState(initial?.hideInCalendar || false);
+  const [anchor, setAnchor] = useState(() => initialAnchor(initial));
   const [startYM, setStartYM] = useState(initial?.startYM || "");
   const [endYM, setEndYM] = useState(initial?.endYM || "");
-  const valid = name.trim() && Number(amount) > 0;
-  const build = () => ({ name: name.trim(), amount: Number(amount), cat, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit) });
+  const issue = cycleIssue(cycle, anchor, startYM, endYM);
+  const valid = !!name.trim() && Number(amount) > 0 && !issue?.block;
+  const build = () => ({ name: name.trim(), amount: Number(amount), cat, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit, anchor) });
 
   return (
     <Sheet title={initial ? "고정수입 수정" : "고정수입 추가"} onClose={onClose}>
@@ -1845,11 +2279,13 @@ function IncomeForm({ initial, onSave, onSkip, onDelete, onClose }) {
       <Field label="금액">
         <MoneyInput value={amount} onChange={setAmount} big />
       </Field>
-      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay}
-        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit} />
-      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
       <div style={S.fieldLabel}>분류</div>
       <CatGrid cats={INCOME_CATS} value={cat} onChange={setCat} />
+      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay} dayLabel="매월 들어오는 날"
+        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit}
+        anchor={anchor} setAnchor={setAnchor} />
+      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
+      <CycleWarn issue={issue} />
       <HideToggle hidden={hidden} setHidden={setHidden} />
       <RecurringFooter valid={valid} editingItem={initial}
         onSaveScope={(scope) => valid && onSave(build(), scope)} onSkip={onSkip} onDelete={onDelete} />
@@ -1897,25 +2333,29 @@ function FixedSaveForm({ initial, onSave, onSkip, onDelete, onClose }) {
   const [unit, setUnit] = useState(initial?.unit || "week");
   const [target, setTarget] = useState(initial?.target || "savings");
   const [hidden, setHidden] = useState(initial?.hideInCalendar || false);
+  const [anchor, setAnchor] = useState(() => initialAnchor(initial));
   const [startYM, setStartYM] = useState(initial?.startYM || "");
   const [endYM, setEndYM] = useState(initial?.endYM || "");
-  const valid = name.trim() && Number(amount) > 0;
-  const build = () => ({ name: name.trim(), amount: Number(amount), target, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit) });
+  const issue = cycleIssue(cycle, anchor, startYM, endYM);
+  const valid = !!name.trim() && Number(amount) > 0 && !issue?.block;
+  const build = () => ({ name: name.trim(), amount: Number(amount), target, hideInCalendar: hidden, startYM: startYM || undefined, endYM: endYM || undefined, ...buildCycle(cycle, day, weekday, everyN, unit, anchor) });
 
   return (
     <Sheet title={initial ? "고정 저축 수정" : "고정 저축"} onClose={onClose}>
-      <div style={S.tip}>매주·격주·매달 등 주기로 빠지는 적금·정기투자예요. <b>비용이 아니라</b> 선택한 자산으로 옮겨지고, 총자산은 줄지 않아요. 만기가 있으면 <b>기간</b>에 종료월을 넣으세요.</div>
+      <div style={S.tip}>매주·격주·매달 등 주기로 빠지는 적금·정기투자예요. <b>비용이 아니라</b> 선택한 자산으로 옮겨지고, 총자산은 줄지 않아요. 만기가 있으면 <b>유효 기간</b>에 종료월을 넣으세요.</div>
       <Field label="이름">
         <input style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 주택청약, 정기적금" autoFocus />
       </Field>
       <Field label="금액">
         <MoneyInput value={amount} onChange={setAmount} />
       </Field>
-      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay}
-        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit} />
-      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
       <div style={S.fieldLabel}>어느 자산으로?</div>
       <CatGrid cats={SAVE_TARGETS} value={target} onChange={setTarget} />
+      <CycleField cycle={cycle} setCycle={setCycle} day={day} setDay={setDay} dayLabel="매월 납입일"
+        weekday={weekday} setWeekday={setWeekday} everyN={everyN} setEveryN={setEveryN} unit={unit} setUnit={setUnit}
+        anchor={anchor} setAnchor={setAnchor} />
+      <PeriodField startYM={startYM} setStartYM={setStartYM} endYM={endYM} setEndYM={setEndYM} />
+      <CycleWarn issue={issue} />
       <HideToggle hidden={hidden} setHidden={setHidden} />
       <RecurringFooter valid={valid} editingItem={initial}
         onSaveScope={(scope) => valid && onSave(build(), scope)} onSkip={onSkip} onDelete={onDelete} />
@@ -2081,6 +2521,12 @@ function CloseForm({ net, income, fixed, variable, saveTotal, saveByTarget, onCo
 
 // 공통 UI 조각
 function Sheet({ title, children, onClose }) {
+  // 시트가 열려 있는 동안 뒤 화면 스크롤 잠금 (모바일에서 배경이 같이 밀리는 문제)
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, []);
   return (
     <div style={S.overlay} onClick={onClose}>
       <div style={S.sheet} onClick={(e) => e.stopPropagation()}>
@@ -2161,7 +2607,37 @@ function ItemRow({ barColor, name, meta, amount, amountColor, onClick }) {
 const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
 
 // 반복 주기 선택 (매월 / 매주 / 사용자 지정)
-function CycleField({ cycle, setCycle, day, setDay, weekday, setWeekday, everyN, setEveryN, unit, setUnit }) {
+// 날짜는 모두 달력(<input type="date">)으로 고른다.
+//  - 매월: 고른 날짜의 '일(日)'만 써서 day에 저장
+//  - 매주 / 직접: 고른 날짜가 anchor(첫 발생일)로 저장돼 occursOn의 기준이 됨
+function CycleField({ cycle, setCycle, day, setDay, weekday, setWeekday, everyN, setEveryN, unit, setUnit,
+  anchor, setAnchor, dayLabel = "매월 며칠" }) {
+  // 매월 피커에 보여줄 날짜(연·월은 무시하고 '일'만 쓴다)
+  const [monthISO, setMonthISO] = useState(() => isoForDay(day));
+  const pickMonthly = (v) => {
+    if (!v) return;
+    setMonthISO(v);
+    setDay(String(Number(v.slice(8))));
+  };
+
+  // 요일 칩 ↔ 시작 날짜를 서로 맞춰준다 (둘이 어긋나면 사용자가 혼란스러움)
+  const pickAnchor = (v) => {
+    setAnchor(v);
+    if (v && cycle === "weekly") setWeekday(parseISO(v).getDay());
+  };
+  const pickWeekday = (i) => {
+    setWeekday(i);
+    if (anchor) {
+      const a = parseISO(anchor);
+      a.setDate(a.getDate() + (i - a.getDay())); // 같은 주의 그 요일로 이동
+      setAnchor(isoOf(a));
+    }
+  };
+
+  const anchorLabel = cycle === "weekly"
+    ? "언제부터 반복 (첫 발생일)"
+    : unit === "month" ? "첫 납입일" : "언제부터 반복 (첫 발생일)";
+
   return (
     <>
       <div style={S.fieldLabel}>반복 주기</div>
@@ -2170,34 +2646,62 @@ function CycleField({ cycle, setCycle, day, setDay, weekday, setWeekday, everyN,
           <button key={v} style={{ ...S.segBtn, ...(cycle === v ? S.segOn : {}) }} onClick={() => setCycle(v)}>{l}</button>
         ))}
       </div>
+
       {cycle === "monthly" && (
-        <Field label="매월 며칠">
-          <input style={S.input} value={day} inputMode="numeric"
-            onChange={(e) => setDay(e.target.value.replace(/[^0-9]/g, ""))} />
-        </Field>
+        <>
+          <div style={S.fieldLabel}>{dayLabel}</div>
+          <input type="date" style={{ ...S.input, colorScheme: "light", marginBottom: 6 }}
+            value={monthISO} onChange={(e) => pickMonthly(e.target.value)} />
+          <div style={S.fieldHint}>
+            매월 <b>{Number(day) || 1}일</b>에 반복돼요. 연·월은 쓰지 않아요.
+            {Number(day) > 28 && " 그 날짜가 없는 달에는 말일에 처리돼요."}
+          </div>
+        </>
       )}
+
       {cycle === "weekly" && (
         <>
           <div style={S.fieldLabel}>무슨 요일</div>
           <div style={S.weekdayRow}>
             {WEEKDAYS.map((w, i) => (
               <button key={w} style={{ ...S.weekdayBtn, ...(weekday === i ? S.weekdayOn : {}) }}
-                onClick={() => setWeekday(i)}>{w}</button>
+                onClick={() => pickWeekday(i)}>{w}</button>
             ))}
+          </div>
+          <div style={S.fieldLabel}>{anchorLabel}</div>
+          <input type="date" style={{ ...S.input, colorScheme: "light", marginBottom: 6 }}
+            value={anchor} onChange={(e) => pickAnchor(e.target.value)} />
+          <div style={S.fieldHint}>
+            {anchor
+              ? <>{anchor.replace(/-/g, ".")}({WEEKDAYS[parseISO(anchor).getDay()]})부터 매주 반복돼요.</>
+              : "비우면 시작일 제한 없이 매주 반복돼요."}
           </div>
         </>
       )}
+
       {cycle === "custom" && (
-        <div style={S.customRow}>
-          <input style={{ ...S.input, width: 70, textAlign: "center" }} value={everyN} inputMode="numeric"
-            onChange={(e) => setEveryN(e.target.value.replace(/[^0-9]/g, ""))} />
-          <div style={S.unitSeg}>
-            {[["day", "일"], ["week", "주"], ["month", "개월"]].map(([v, l]) => (
-              <button key={v} style={{ ...S.segBtn, ...(unit === v ? S.segOn : {}) }} onClick={() => setUnit(v)}>{l}</button>
-            ))}
+        <>
+          <div style={S.customRow}>
+            <input style={{ ...S.input, width: 70, textAlign: "center" }} value={everyN} inputMode="numeric"
+              onChange={(e) => setEveryN(e.target.value.replace(/[^0-9]/g, ""))} />
+            <div style={S.unitSeg}>
+              {[["day", "일"], ["week", "주"], ["month", "개월"]].map(([v, l]) => (
+                <button key={v} style={{ ...S.segBtn, ...(unit === v ? S.segOn : {}) }} onClick={() => setUnit(v)}>{l}</button>
+              ))}
+            </div>
+            <span style={S.customSuffix}>마다</span>
           </div>
-          <span style={S.customSuffix}>마다</span>
-        </div>
+          <div style={S.fieldLabel}>{anchorLabel}</div>
+          <input type="date" style={{ ...S.input, colorScheme: "light", marginBottom: 6 }}
+            value={anchor} onChange={(e) => setAnchor(e.target.value)} />
+          <div style={S.fieldHint}>
+            {anchor ? (
+              unit === "month"
+                ? <>{anchor.replace(/-/g, ".")}부터 {Math.max(1, Number(everyN) || 1)}개월마다 <b>{parseISO(anchor).getDate()}일</b>에 반복돼요.</>
+                : <>{anchor.replace(/-/g, ".")}부터 {Math.max(1, Number(everyN) || 1)}{unit === "day" ? "일" : "주"}마다 반복돼요.</>
+            ) : "비우면 오늘부터 시작해요."}
+          </div>
+        </>
       )}
     </>
   );
@@ -2213,12 +2717,16 @@ function HideToggle({ hidden, setHidden }) {
   );
 }
 
-// 반복 항목의 cycle 관련 필드를 객체로 묶어 반환
-function buildCycle(cycle, day, weekday, everyN, unit) {
-  if (cycle === "weekly") return { cycle, weekday };
-  if (cycle === "custom") return { cycle, everyN: Math.max(1, Number(everyN) || 1), unit, anchor: todayISO };
+// 반복 항목의 cycle 관련 필드를 객체로 묶어 반환.
+// anchor = 사용자가 고른 첫 발생일. custom은 미선택 시 오늘로 폴백(기존 동작),
+// weekly는 미선택 시 anchor 없이 저장해 구 데이터와 똑같이 동작하게 둔다.
+function buildCycle(cycle, day, weekday, everyN, unit, anchor) {
+  if (cycle === "weekly") return { cycle, weekday, anchor: anchor || undefined };
+  if (cycle === "custom") return { cycle, everyN: Math.max(1, Number(everyN) || 1), unit, anchor: anchor || todayISO };
   return { cycle, day: Number(day) || 1 };
 }
+// 폼의 anchor 초기값: 기존 값 → 없으면 신규는 오늘, 수정은 빈 값(기존 동작 유지)
+const initialAnchor = (initial) => initial?.anchor ?? (initial ? "" : todayISO);
 
 // ─────────────────────────────────────────────────────────────
 const KEYFRAMES = `
@@ -2294,13 +2802,39 @@ const S = {
   budgetLegend: { display: "flex", gap: 14, marginTop: 8, fontSize: 11.5, color: "#7A7468", alignItems: "center" },
   miniDot: { display: "inline-block", width: 8, height: 8, borderRadius: 3, marginRight: 4, verticalAlign: "middle" },
 
-  tabs: { display: "flex", gap: 0, padding: "0 20px", borderBottom: "1px solid #EAE3D6", justifyContent: "space-between" },
-  tab: { background: "none", border: "none", padding: "12px 2px 14px", fontSize: 14, fontWeight: 600, color: "#A39C8F", borderBottom: "2px solid transparent", marginBottom: -1, whiteSpace: "nowrap" },
+  // 탭 5개 — 각 탭이 폭을 균등 분할(flex:1)해 320px에서도 탭당 약 60×44px 터치 영역.
+  // space-between으로 두면 버튼이 글자 폭만큼만 커져 '달력'이 26px밖에 안 됐다.
+  tabs: { display: "flex", gap: 0, padding: "0 8px", borderBottom: "1px solid #EAE3D6" },
+  tab: { flex: 1, minWidth: 0, background: "none", border: "none", padding: "13px 0 15px", fontSize: 13.5, fontWeight: 600, color: "#A39C8F", borderBottom: "2px solid transparent", marginBottom: -1, whiteSpace: "nowrap", letterSpacing: "-0.02em", textAlign: "center" },
   tabOn: { color: INK, borderBottomColor: ACCENT },
+
+  // 대시보드 — 4분할 요약 카드
+  sumGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 },
+  sumCard: { background: "#fff", border: "1px solid #EFE9DD", borderRadius: 14, padding: "13px 14px" },
+  sumCardTop: { display: "flex", alignItems: "center", gap: 6, marginBottom: 7 },
+  sumCardLabel: { fontSize: 12, color: "#8A8479", fontWeight: 600 },
+  sumCardVal: { fontSize: 18, fontWeight: 800, letterSpacing: "-0.03em", fontVariantNumeric: "tabular-nums" },
+  sumCardUnit: { fontSize: 12, fontWeight: 600, marginLeft: 2 },
+  cmpRow: { marginTop: 12, background: "#F2EEE2", borderRadius: 12, padding: "11px 14px", fontSize: 12.5, color: "#6B655B", lineHeight: 1.5 },
+  emptyCta: { display: "flex", flexDirection: "column", gap: 8, padding: "0 8px" },
+  emptyCtaMain: { width: "100%", background: INK, color: PAPER, border: "none", borderRadius: 13, padding: "15px 0", fontSize: 15, fontWeight: 700 },
+  emptyCtaSub: { width: "100%", background: "#fff", border: "1px solid #E4DCCC", borderRadius: 13, padding: "13px 0", fontSize: 14, fontWeight: 600, color: "#4A4540" },
+
+  // 대시보드 — 남는 돈 추이 미니 막대
+  trendRow: { display: "flex", alignItems: "flex-end", gap: 6, height: 96 },
+  trendCol: { flex: 1, display: "flex", flexDirection: "column", height: "100%" },
+  trendUpper: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end" },
+  trendBase: { height: 1, background: "#E4DCCC" },
+  trendLower: { height: 26, display: "flex", flexDirection: "column" },
+  trendBar: { width: "100%", borderRadius: 4, transition: "height .4s ease" },
+  trendLabel: { textAlign: "center", fontSize: 10.5, color: "#A39C8F", marginTop: 5 },
+  todayTag: { marginLeft: 6, background: `${ACCENT}14`, borderRadius: 5, padding: "1px 6px", fontSize: 11, fontWeight: 700, color: ACCENT },
 
   main: { padding: "18px 16px 0" },
   tip: { background: "#F2EEE2", borderRadius: 12, padding: "11px 14px", fontSize: 12.5, color: "#6B655B", lineHeight: 1.5, marginBottom: 14 },
   pastNote: { background: "#FBF3E7", borderRadius: 10, padding: "9px 12px", fontSize: 12, color: "#A8763C", lineHeight: 1.5, marginTop: -6, marginBottom: 14 },
+  errNote: { background: "#F7ECE9", borderRadius: 10, padding: "9px 12px", fontSize: 12, color: "#A8483C", lineHeight: 1.5, marginBottom: 14, fontWeight: 600 },
+  fieldHint: { fontSize: 11.5, color: "#9A958B", lineHeight: 1.5, marginBottom: 14 },
   searchWrap: { display: "flex", alignItems: "center", gap: 8, background: "#fff", border: "1px solid #E4DCCC", borderRadius: 12, padding: "0 12px", marginBottom: 14 },
   searchIcon: { fontSize: 18, color: "#A39C8F" },
   searchInput: { flex: 1, border: "none", outline: "none", background: "none", padding: "12px 0", fontSize: 15, color: INK },
@@ -2426,6 +2960,9 @@ const S = {
   allocMini: { display: "flex", alignItems: "center", gap: 8, padding: "4px 0" },
   allocMiniLabel: { fontSize: 13, color: "#6B655B", flex: 1 },
   allocMiniVal: { fontSize: 13, fontWeight: 700, fontVariantNumeric: "tabular-nums" },
+  backupHead: { padding: "28px 4px 8px", fontSize: 12.5, color: "#8A8479", fontWeight: 600 },
+  backupRow: { display: "flex", gap: 8 },
+  backupBtn: { flex: 1, background: "#fff", border: "1px solid #E4DCCC", borderRadius: 12, padding: "12px 0", fontSize: 13, fontWeight: 600, color: "#4A4540" },
   resetBtn: { width: "100%", marginTop: 28, background: "none", border: "1px solid #E4DCCC", borderRadius: 12, padding: "12px 0", fontSize: 13, fontWeight: 600, color: "#B0683C" },
   storeNote: { textAlign: "center", fontSize: 11.5, color: "#A39C8F", marginTop: 10, lineHeight: 1.5 },
   emptyTitle: { fontSize: 17, fontWeight: 700, marginBottom: 8 },
