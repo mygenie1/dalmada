@@ -852,6 +852,7 @@ export default function Dalmada() {
             thisMonthNet={thisMonthNet}
             history={history}
             upcoming={upcoming}
+            variable={variable}
             isEmpty={isEmptyMonth}
             onEdit={openEdit}
             onAdd={openAdd}
@@ -1218,7 +1219,7 @@ function RemainHero({ incomeTotal, monthTotal, varTotal, saveTotal }) {
 // ─────────────────────────────────────────────────────────────
 // 대시보드 = 이번 달 요약 홈. 위쪽 '쓸 수 있는 돈' 히어로(RemainHero)는 Dalmada가 렌더.
 // 모든 수치는 메인에서 계산된 값을 props로 받는다 (여기서 회계 계산을 하지 않는다).
-function Dashboard({ incomeTotal, monthTotal, varTotal, saveTotal, thisMonthNet, history, upcoming, isEmpty, onEdit, onAdd, onGoTab }) {
+function Dashboard({ incomeTotal, monthTotal, varTotal, saveTotal, thisMonthNet, history, upcoming, variable, isEmpty, onEdit, onAdd, onGoTab }) {
   if (isEmpty) {
     return (
       <>
@@ -1253,6 +1254,44 @@ function Dashboard({ incomeTotal, monthTotal, varTotal, saveTotal, thisMonthNet,
     .slice()
     .sort((a, b) => b.amount - a.amount)
     .slice(0, 3);
+
+  // ── 예산 페이스: 수입 대비 지금까지 나간 비율 vs 날짜 진행률.
+  // 지출률이 날짜 진행률보다 앞서면 경고(RemainHero의 "하루치보다 빠르다" 판정과 같은 취지).
+  const dayNow = today.getDate();
+  const daysInMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+  const daysLeft = daysInMonth - dayNow;
+  const spent = monthTotal + varTotal + saveTotal;
+  const spentPct = incomeTotal > 0 ? Math.round((spent / incomeTotal) * 100) : null;
+  const datePct = Math.round((dayNow / daysInMonth) * 100);
+  const fastPace = spentPct !== null && spentPct > datePct;
+
+  // ── 오늘 / 이번 주(월요일~오늘) 변동비. date가 없는 구 데이터는 오늘·이번 주에서 제외한다.
+  const thisMonthVar = variable.filter((i) => inMonth(i));
+  const todaySpend = thisMonthVar.filter((i) => i.date === todayISO).reduce((s, i) => s + i.amount, 0);
+  const weekStartISO = isoOf(new Date(today.getFullYear(), today.getMonth(), dayNow - ((today.getDay() + 6) % 7)));
+  const weekSpend = variable
+    .filter((i) => i.date && i.date >= weekStartISO && i.date <= todayISO)
+    .reduce((s, i) => s + i.amount, 0);
+
+  // ── 지출 카테고리 톱3 (이번 달 변동비만. 고정비는 고정비 탭에서 분류별로 이미 보여줌)
+  const varByCat = {};
+  thisMonthVar.forEach((i) => { varByCat[i.cat] = (varByCat[i.cat] || 0) + i.amount; });
+  const top3 = Object.entries(varByCat)
+    .map(([k, v]) => ({ ...catOf(k), value: v }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 3);
+  const topMax = top3.length ? top3[0].value : 0;
+
+  // ── 인사이트: 지난달과 하루 평균 변동비 비교 (고정비는 날짜와 무관해 제외)
+  let dailyInsight = null;
+  if (prev && prev.variable > 0 && dayNow > 0) {
+    const [py, pm] = prev.ym.split(".").map(Number);
+    const prevDays = new Date(py, pm, 0).getDate();
+    const prevDaily = prev.variable / prevDays;
+    const curDaily = varTotal / dayNow;
+    const gap = Math.round(curDaily - prevDaily);
+    if (Math.abs(gap) >= 100) dailyInsight = { gap, prevDaily: Math.round(prevDaily) };
+  }
 
   const cards = [
     { label: "수입", value: incomeTotal, color: "#2E8B6B", sign: "+" },
@@ -1291,8 +1330,74 @@ function Dashboard({ incomeTotal, monthTotal, varTotal, saveTotal, thisMonthNet,
         </div>
       )}
 
+      {/* 예산 페이스: 수입이 있어야 비율이 의미가 있다 */}
+      {spentPct !== null && (
+        <div style={{ ...S.card, marginTop: 12 }}>
+          <div style={S.paceHead}>
+            <span style={S.cardTitle}>이번 달 예산 페이스</span>
+            <span style={{ ...S.pacePct, color: fastPace ? "#C0566B" : ACCENT }}>{spentPct}%</span>
+          </div>
+          <div style={S.paceTrack}>
+            <div style={{ ...S.paceFill, width: `${Math.min(100, spentPct)}%`, background: fastPace ? "#C0566B" : ACCENT }} />
+            <div style={{ ...S.paceMark, left: `${Math.min(100, datePct)}%` }} />
+          </div>
+          <div style={S.paceNote}>
+            수입의 <b>{spentPct}%</b> 사용 · 이번 달 <b>{daysLeft > 0 ? `${daysLeft}일 남음` : "마지막 날"}</b>
+            {fastPace ? (
+              <span style={{ color: "#C0566B" }}> · 날짜 진행({datePct}%)보다 빠른 편이에요</span>
+            ) : (
+              <span style={{ color: "#3A6B55" }}> · 날짜 진행({datePct}%)보다 여유 있어요</span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 오늘 / 이번 주 변동비 — 변동비 기록이 있어야 의미가 있다 */}
+      {thisMonthVar.length > 0 && (
+        <div style={S.duoGrid}>
+          <div style={S.sumCard}>
+            <div style={S.duoLabel}>오늘 쓴 돈</div>
+            <div style={{ ...S.duoVal, color: todaySpend > 0 ? "#D98244" : "#B9B3A8" }}>
+              {won(todaySpend)}<span style={S.sumCardUnit}>원</span>
+            </div>
+          </div>
+          <div style={S.sumCard}>
+            <div style={S.duoLabel}>이번 주(월~오늘)</div>
+            <div style={{ ...S.duoVal, color: weekSpend > 0 ? "#D98244" : "#B9B3A8" }}>
+              {won(weekSpend)}<span style={S.sumCardUnit}>원</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {dailyInsight && (
+        <div style={S.cmpRow}>
+          지난달 하루 평균 <b>{won(dailyInsight.prevDaily)}원</b>보다{" "}
+          <b style={{ color: dailyInsight.gap > 0 ? "#C0566B" : "#2E8B6B" }}>
+            하루 {won(Math.abs(dailyInsight.gap))}원 {dailyInsight.gap > 0 ? "더" : "덜"}
+          </b>{" "}
+          쓰는 중이에요
+        </div>
+      )}
+
+      {/* 지출 카테고리 톱3 (이번 달 변동비) */}
+      {top3.length > 0 && (
+        <div style={{ ...S.card, marginTop: 12 }}>
+          <div style={S.cardTitle}>많이 쓴 곳 톱{top3.length}</div>
+          {top3.map((c) => (
+            <div key={c.key} style={S.topRow}>
+              <span style={S.topName}>{c.label}</span>
+              <span style={S.topTrack}>
+                <span style={{ ...S.topFill, width: `${topMax > 0 ? (c.value / topMax) * 100 : 0}%`, background: c.color }} />
+              </span>
+              <span style={S.topVal}>{won(c.value)}원</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {history.length > 0 && (
-        <div style={{ ...S.card, marginTop: 16 }}>
+        <div style={{ ...S.card, marginTop: 12 }}>
           <div style={S.cardTitle}>최근 남는 돈 추이</div>
           <NetTrend points={trend} />
         </div>
@@ -2020,7 +2125,10 @@ function CalendarView({ fixed, income, fixedSave, variable, varIncome, varSave, 
       const inSum = e.income.reduce((s, i) => s + i.amount, 0);
       const exSum = e.expense.reduce((s, i) => s + i.amount, 0);
       const svSum = e.save.reduce((s, i) => s + i.amount, 0);
-      if (inSum || exSum || svSum) map[d] = { e, inSum, exSum, svSum };
+      // 칸에 찍는 순합계 = 그날 지갑 잔고의 변화. 저축은 '비용'은 아니지만 지갑에선 나가므로 뺀다
+      // (자산 이동이라는 회계 규칙은 그대로고, 여기서는 달력의 "그날 얼마가 들고 났나" 표시용).
+      const net = inSum - exSum - svSum;
+      if (inSum || exSum || svSum) map[d] = { e, inSum, exSum, svSum, net };
     }
     return map;
   }, [fixed, income, fixedSave, variable, varIncome, varSave, ym, daysInMonth, isThisMonth]);
@@ -2066,18 +2174,20 @@ function CalendarView({ fixed, income, fixedSave, variable, varIncome, varSave, 
               onClick={() => setOpenDay(isOpen ? null : d)}
             >
               <div style={{ ...S.cellDay, ...(isToday ? S.cellToday : {}) }}>{d}</div>
-              {dd?.inSum > 0 && <div style={{ ...S.cellBadge, color: "#2E8B6B" }}>+{compact(dd.inSum)}</div>}
-              {dd?.exSum > 0 && <div style={{ ...S.cellBadge, color: ACCENT }}>-{compact(dd.exSum)}</div>}
-              {dd?.svSum > 0 && <div style={{ ...S.cellBadge, color: "#C98A3B" }}>→{compact(dd.svSum)}</div>}
+              {!!dd?.net && (
+                <div style={{ ...S.cellBadge, color: dd.net > 0 ? "#2E8B6B" : ACCENT }}>
+                  {dd.net > 0 ? "+" : "−"}{compact(Math.abs(dd.net))}
+                </div>
+              )}
             </button>
           );
         })}
       </div>
 
+      {/* 칸에는 그날 순합계(수입 − 지출 − 저축) 하나만. 구분 내역은 날짜를 눌러 아래 상세에서 본다. */}
       <div style={S.calKey}>
-        <span><i style={{ ...S.miniDot, background: "#2E8B6B" }} />수입</span>
-        <span><i style={{ ...S.miniDot, background: ACCENT }} />지출</span>
-        <span><i style={{ ...S.miniDot, background: "#C98A3B" }} />저축</span>
+        <span><i style={{ ...S.miniDot, background: "#2E8B6B" }} />들어온 게 많은 날</span>
+        <span><i style={{ ...S.miniDot, background: ACCENT }} />나간 게 많은 날</span>
       </div>
 
       {/* 선택한 날짜 상세 */}
@@ -2823,6 +2933,10 @@ const KEYFRAMES = `
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 input:focus { outline: none; border-color:#1F4E6B !important; }
 button { font-family: inherit; cursor: pointer; }
+/* 클릭 후 남는 포커스 흔적 제거. 단 키보드 이동(:focus-visible)은 살려둔다. */
+button:focus { outline: none; }
+button:focus-visible { outline: 2px solid #1F4E6B; outline-offset: 2px; }
+button::-moz-focus-inner { border: 0; }
 @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
 `;
 
@@ -2893,7 +3007,7 @@ const S = {
   // 탭 5개 — 각 탭이 폭을 균등 분할(flex:1)해 320px에서도 탭당 약 60×44px 터치 영역.
   // space-between으로 두면 버튼이 글자 폭만큼만 커져 '달력'이 26px밖에 안 됐다.
   tabs: { display: "flex", gap: 0, padding: "0 8px", borderBottom: "1px solid #EAE3D6" },
-  tab: { flex: 1, minWidth: 0, background: "none", border: "none", padding: "13px 0 15px", fontSize: 13.5, fontWeight: 600, color: "#A39C8F", borderBottom: "2px solid transparent", marginBottom: -1, whiteSpace: "nowrap", letterSpacing: "-0.02em", textAlign: "center" },
+  tab: { flex: 1, minWidth: 0, background: "none", border: "none", outline: "none", WebkitTapHighlightColor: "transparent", padding: "13px 0 15px", fontSize: 13.5, fontWeight: 600, color: "#A39C8F", borderBottom: "2px solid transparent", marginBottom: -1, whiteSpace: "nowrap", letterSpacing: "-0.02em", textAlign: "center" },
   tabOn: { color: INK, borderBottomColor: ACCENT },
 
   // 대시보드 — 4분할 요약 카드
@@ -2903,6 +3017,26 @@ const S = {
   sumCardLabel: { fontSize: 12, color: "#8A8479", fontWeight: 600 },
   sumCardVal: { fontSize: 18, fontWeight: 800, letterSpacing: "-0.03em", fontVariantNumeric: "tabular-nums" },
   sumCardUnit: { fontSize: 12, fontWeight: 600, marginLeft: 2 },
+  // 홈: 예산 페이스 게이지 (회색 세로선 = 오늘까지의 날짜 진행률)
+  paceHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline" },
+  pacePct: { fontSize: 17, fontWeight: 800, fontVariantNumeric: "tabular-nums" },
+  paceTrack: { position: "relative", marginTop: 4, height: 10, borderRadius: 6, background: "#EAE3D6", overflow: "hidden" },
+  paceFill: { height: "100%", borderRadius: 6, transition: "width .5s ease" },
+  paceMark: { position: "absolute", top: 0, bottom: 0, width: 2, background: "#8A8479", opacity: 0.55 },
+  paceNote: { marginTop: 9, fontSize: 12, color: "#8A8479", lineHeight: 1.5 },
+
+  // 홈: 오늘 / 이번 주 지출
+  duoGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 },
+  duoLabel: { fontSize: 12, color: "#8A8479", fontWeight: 600 },
+  duoVal: { fontSize: 18, fontWeight: 800, marginTop: 7, letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums" },
+
+  // 홈: 많이 쓴 곳 톱3
+  topRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 9 },
+  topName: { fontSize: 13, color: "#4A4540", width: 62, flexShrink: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  topTrack: { flex: 1, height: 8, borderRadius: 5, background: "#EFEADF", overflow: "hidden" },
+  topFill: { display: "block", height: "100%", borderRadius: 5, transition: "width .5s ease" },
+  topVal: { fontSize: 12.5, fontWeight: 700, color: "#4A4540", width: 76, textAlign: "right", fontVariantNumeric: "tabular-nums" },
+
   cmpRow: { marginTop: 12, background: "#F2EEE2", borderRadius: 12, padding: "11px 14px", fontSize: 12.5, color: "#6B655B", lineHeight: 1.5 },
   emptyCta: { display: "flex", flexDirection: "column", gap: 8, padding: "0 8px" },
   emptyCtaMain: { width: "100%", background: INK, color: PAPER, border: "none", borderRadius: 13, padding: "15px 0", fontSize: 15, fontWeight: 700 },
