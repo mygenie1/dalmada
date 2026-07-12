@@ -249,6 +249,11 @@ function monthLabel(offset) {
 const SEED_HISTORY = [];
 
 // ── 기기 저장 (localStorage). 외부 서버·회원가입 없이 이 기기에만 보관 ──
+// 뒤로가기(back) 처리: "한 번 더 누르면 종료" 대기 시간(ms)과 하드웨어 back 버튼 유무.
+// iOS는 하드웨어 back이 없어(스와이프는 브라우저가 관리) 종료 안내를 띄우지 않는다.
+const EXIT_MS = 2000;
+const HAS_HW_BACK = typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent || "");
+
 const STORE_KEY = "dalmada:v1";
 
 // 저장본(또는 백업 파일)을 앱 상태로 정규화. 없는 필드는 기본값으로 채워 하위호환.
@@ -317,6 +322,8 @@ export default function Dalmada() {
   const [showAssetForm, setShowAssetForm] = useState(false);
   const [showCloseForm, setShowCloseForm] = useState(false);
   const [pickMenu, setPickMenu] = useState(null); // 'income' | 'expense' | null
+  const [calDay, setCalDay] = useState(null); // 달력에서 펼친 날짜(1~31). 뒤로가기로 접으려고 여기서 관리
+  const [backToast, setBackToast] = useState(false); // "한 번 더 누르면 종료됩니다"
 
   const openAdd = (type) => setEditing({ type, item: null });
   const openEdit = (type, item) => setEditing({ type, item });
@@ -655,8 +662,86 @@ export default function Dalmada() {
     setOnboarded(true);
   };
 
+  // ── 안드로이드 뒤로가기 ────────────────────────────────────
+  // 브라우저는 back을 직접 막을 수 없으므로, history에 "가드 엔트리"를 하나 쌓아두고
+  // popstate로 가로챈다. 앱을 유지해야 하면 가드를 다시 쌓고, 종료시켜야 하면 쌓지 않는다.
+  // (가드가 없는 상태에서 back을 누르면 브라우저 기본 동작 = 앱 종료)
+  const backState = useRef({});
+  // 의존성 배열 없음 → 매 렌더마다 최신 상태를 ref에 담는다.
+  // popstate 핸들러는 마운트 시 한 번만 등록되므로, 상태를 ref로만 읽어 stale closure를 피한다.
+  useEffect(() => {
+    backState.current = { tab, editing, pickMenu, showAssetForm, showCloseForm, calDay };
+  });
+
+  // 달력 탭을 벗어나면 펼친 날짜도 접는다(예전에 CalendarView가 언마운트되며 하던 일).
+  useEffect(() => {
+    if (tab !== "calendar") setCalDay(null);
+  }, [tab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.history?.pushState) return;
+    let toastTimer = null;
+    const pushGuard = () => {
+      try {
+        window.history.pushState({ dalmadaGuard: true }, "");
+      } catch {
+        // pushState 호출 제한 등으로 실패해도 앱 동작에는 영향이 없다(기본 back으로 폴백).
+      }
+    };
+    pushGuard();
+
+    const onPop = () => {
+      const s = backState.current;
+
+      // 1) 떠 있는 오버레이부터 닫는다(가장 위에 있는 것 우선).
+      //    각 오버레이의 onClose와 동일한 정리를 하도록 같은 setter를 쓴다.
+      const closeTop =
+        s.editing ? () => setEditing(null)
+        : s.showCloseForm ? () => setShowCloseForm(false)
+        : s.showAssetForm ? () => setShowAssetForm(false)
+        : s.pickMenu ? () => setPickMenu(null)
+        : s.calDay != null ? () => setCalDay(null)
+        : null;
+      if (closeTop) {
+        closeTop();
+        pushGuard();
+        return;
+      }
+
+      // 2) 오버레이가 없고 홈이 아니면 홈으로.
+      if (s.tab !== "dash") {
+        setTab("dash");
+        pushGuard();
+        return;
+      }
+
+      // 3) 홈 + 오버레이 없음 → 가드를 복원하지 않는다. 이 상태에서 back을 한 번 더 누르면
+      //    가로챌 엔트리가 없어 앱이 실제로 종료된다. 2초가 지나면 가드를 다시 쌓아 리셋.
+      if (HAS_HW_BACK) {
+        setBackToast(true);
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+          setBackToast(false);
+          pushGuard();
+        }, EXIT_MS);
+      }
+      // 하드웨어 back이 없는 기기(iOS 스와이프 back 등)에서는 안내 없이 히스토리를 그대로 넘긴다.
+    };
+
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      clearTimeout(toastTimer);
+    };
+  }, []);
+
   if (!onboarded) {
-    return <Onboarding onDone={finishOnboarding} onSkip={() => setOnboarded(true)} />;
+    return (
+      <>
+        <Onboarding onDone={finishOnboarding} onSkip={() => setOnboarded(true)} />
+        {backToast && <div style={S.toast}>한 번 더 누르면 종료됩니다</div>}
+      </>
+    );
   }
 
   return (
@@ -794,6 +879,8 @@ export default function Dalmada() {
             varIncome={varIncome}
             varSave={varSave}
             onEdit={openEdit}
+            openDay={calDay}
+            setOpenDay={setCalDay}
           />
         )}
         {tab === "month" && (
@@ -881,6 +968,7 @@ export default function Dalmada() {
           }}
         />
       )}
+      {backToast && <div style={S.toast}>한 번 더 누르면 종료됩니다</div>}
     </div>
   );
 }
@@ -1893,10 +1981,10 @@ function Donut({ data, total, center }) {
 // ─────────────────────────────────────────────────────────────
 // 캘린더: 고정비 결제일(파랑) + 변동비 지출(주황) 함께 표시
 // ─────────────────────────────────────────────────────────────
-function CalendarView({ fixed, income, fixedSave, variable, varIncome, varSave, onEdit }) {
+// openDay(펼친 날짜)는 뒤로가기로 닫을 수 있도록 Dalmada()가 들고 있는 제어 상태다.
+function CalendarView({ fixed, income, fixedSave, variable, varIncome, varSave, onEdit, openDay, setOpenDay }) {
   const now = new Date();
   const [ym, setYm] = useState({ y: now.getFullYear(), m: now.getMonth() });
-  const [openDay, setOpenDay] = useState(null);
 
   const daysInMonth = new Date(ym.y, ym.m + 1, 0).getDate();
   const startPad = new Date(ym.y, ym.m, 1).getDay();
@@ -2911,6 +2999,10 @@ const S = {
   upDay: { fontSize: 13, fontWeight: 700, width: 34, color: ACCENT, fontVariantNumeric: "tabular-nums" },
   upName: { fontSize: 14, flex: 1, color: "#4A4540" },
   upAmt: { fontSize: 14, fontWeight: 700, fontVariantNumeric: "tabular-nums" },
+
+  toast: { position: "fixed", left: "50%", bottom: 28, transform: "translateX(-50%)", background: "rgba(43,38,32,.92)", color: PAPER,
+    padding: "11px 18px", borderRadius: 999, fontSize: 13.5, fontWeight: 600, letterSpacing: "-0.01em", whiteSpace: "nowrap",
+    boxShadow: "0 6px 20px rgba(43,38,32,.25)", animation: "pop .2s ease", pointerEvents: "none", zIndex: 90 },
 
   overlay: { position: "fixed", inset: 0, background: "rgba(43,38,32,.4)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 50 },
   sheet: { width: "100%", maxWidth: 480, background: PAPER, borderRadius: "22px 22px 0 0", padding: "10px 20px 26px", animation: "pop .25s ease", maxHeight: "92vh", overflowY: "auto" },
