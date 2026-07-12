@@ -20,7 +20,7 @@ index.html            진입 HTML (PWA 메타 포함)
 vite.config.js        Vite + vite-plugin-pwa 설정 (아이콘·manifest)
 src/
   main.jsx            React 진입점 (Dalmada 컴포넌트를 렌더)
-  Dalmada.jsx         ★ 앱 전체 (약 2,400줄). 거의 모든 작업은 이 파일에서 이뤄짐
+  Dalmada.jsx         ★ 앱 전체 (약 3,200줄). 거의 모든 작업은 이 파일에서 이뤄짐
   index.css           전역 배경·폰트 정도의 최소 스타일
 public/               PWA 아이콘(icon-192/512.png), favicon.svg
 ```
@@ -30,13 +30,18 @@ public/               PWA 아이콘(icon-192/512.png), favicon.svg
 1. **상수·헬퍼** (상단): 카테고리 정의(FIXED_CATS, VAR_CATS, INCOME_CATS, VAR_INCOME_CATS, ASSET_CATS, SAVE_TARGETS), 금액 포맷 `won()`, 반복 주기 계산(`monthly`, `cycleLabel`, `occursOn`, `amountForMonth`, `amountIn`, `inPeriod`, `inMonth`), 기간/예외 헬퍼(`overrideFor`, `isSkipped`), 다가올 결제일(`upcomingIn` — 고정비 탭과 대시보드가 공유), 날짜 헬퍼(`parseISO`, `isoOf`, `pad2`, `isoForDay`, `initialDate`, `dateFields`, `initialAnchor`), 검증(`cycleIssue`), localStorage 입출력(`normalizeState`, `isValidBackup`, `loadState`, `saveState`, STORE_KEY = "dalmada:v1"). 시드 데이터(SEED_*)는 현재 전부 비어 있음(신규 사용자는 온보딩으로 시작).
    - **날짜 문자열은 반드시 `parseISO()`로 파싱**하라. `new Date("YYYY-MM-DD")`는 UTC로 해석돼 KST에서 하루 밀린다. ISO 문자열을 만들 때도 `toISOString()` 대신 `isoOf()`를 쓴다.
 2. **메인 컴포넌트** `Dalmada()`: 모든 상태(fixed, variable, income, varIncome, fixedSave, varSave, assets, history, lastYM, onboarded 등)와 핸들러(saveItem, deleteItem, skipThisMonth, handleClose 자동/수동 마감), 탭 렌더링. `onboarded`가 false면 `<Onboarding>`을 먼저 렌더.
+   - **오버레이 상태**는 여기 모여 있다: `editing`(입력·수정 시트 6종), `pickMenu`(종류 선택 시트), `showAssetForm`, `showCloseForm`, `calDay`(달력에서 펼친 날짜 — 뒤로가기로 접으려고 `CalendarView` 밖으로 끌어올린 제어 상태). **새 모달/시트를 추가하면 아래 뒤로가기 1단계 목록에도 반드시 넣어라.**
+   - **안드로이드 뒤로가기**: 마운트 시 `history.pushState`로 "가드 엔트리"를 하나 쌓고 `popstate`로 back을 가로챈다. ① 떠 있는 오버레이부터 닫고 ② 홈(dash)이 아니면 홈으로 보내고 ③ 홈이면 토스트("한 번 더 누르면 종료됩니다") 후 2초 내 재입력 시 종료. 앱을 유지할 때만 가드를 다시 쌓고, 종료시킬 때는 쌓지 않아 브라우저 기본 동작으로 나간다. 핸들러는 마운트 시 한 번만 등록되므로 상태는 `backState` **ref로만** 읽는다(의존성 없는 `useEffect`가 매 렌더 갱신) — 여기서 상태를 직접 참조하면 stale closure 버그가 난다. 하드웨어 back이 없는 기기(`HAS_HW_BACK` = 안드로이드 UA)에서는 ③의 종료 안내를 띄우지 않는다.
 3. **화면 컴포넌트**: Onboarding, PickSheet, RemainHero, Dashboard(이번 달 요약 홈), FixedTab(고정수입·고정비·고정저축), NetTrend, CalendarView, MonthView, AssetView 등.
    - 탭은 5개: `dash`(홈) / `fixed`(고정비) / `month`(이번 달) / `calendar`(달력) / `asset`(총자산). 라벨은 좁은 화면(320px)에 맞춰 짧게 유지하고, `S.tab`은 `flex:1`로 균등 분할해 탭당 약 60×44px 터치 영역을 확보한다. **탭을 더 늘리거나 라벨을 길게 바꾸면 이 폭 계산이 깨진다.**
    - 히어로는 탭별로 다르다: `dash`·`month` → `RemainHero`(쓸 수 있는 돈), `fixed` → 월/연 환산 토글(`heroView`), `calendar`·`asset` → 없음(`asset`은 자체 `assetHero` 보유).
    - `MonthView`와 `FixedTab`은 고정수입·고정저축 목록이 의도적으로 겹친다. `month` 탭은 "남는 돈이 어떻게 나왔는지"의 근거라서 빼면 안 된다.
+   - `Dashboard`(홈)는 **회계 계산을 직접 하지 않는다.** 메인이 계산한 값(incomeTotal/monthTotal/varTotal/saveTotal/thisMonthNet/history/upcoming)과 `variable` 배열만 받아 표시용 파생값을 집계할 뿐이다. 블록 순서: 4칸 요약 → 지난달 대비 → **예산 페이스 게이지**(지출률 vs 날짜 진행률, 앞서면 경고색) → **오늘/이번 주 변동비**(이번 주 = 월요일~오늘, `date` ISO 문자열 비교) → **하루 평균 인사이트**(마감 기록 있을 때만) → **지출 카테고리 톱3**(이번 달 변동비, 카테고리 색 재사용) → 남는 돈 추이 → 다가올 큰 지출. 데이터가 없는 블록은 각각 조건부로 숨긴다(0으로 채워진 카드를 만들지 말 것). 신규 사용자는 `isEmpty` 빈 상태 화면이 우선.
+   - `CalendarView`의 날짜 칸에는 **그날 순합계 하나만** 찍는다(순합계 = 수입 − 지출 − 저축납입, 양수 초록·음수 ACCENT·0이면 미표시). 저축을 빼는 건 "그날 지갑 잔고가 얼마 변했나"를 보여주는 표시용 파생값일 뿐, 저축=자산 이동이라는 회계 규칙과는 무관하다. 수입·지출·저축 **구분 내역은 날짜를 눌렀을 때의 상세**(`upBox`)에서 보여주므로 `eventsOn`/`dayData`의 inSum·exSum·svSum은 그대로 둔다.
 4. **폼 컴포넌트**: FixedForm, VarForm, IncomeForm, VarIncomeForm, FixedSaveForm, VarSaveForm, AssetForm, CloseForm. 모두 추가/수정 겸용(`initial` prop 있으면 수정). 공용 조각: Field, MoneyInput(실시간 콤마), CatGrid, CycleField(주기 선택 + 시작 날짜), PeriodField(유효 기간=month 선택기), DateField(전체 날짜 선택), CycleWarn, PastDateNote, HideToggle, FormFooter, RecurringFooter, ItemRow.
    - 필드 순서는 여섯 폼이 "이름/금액 → 분류 → 주기·날짜 → 기간 → 숨김"으로 통일돼 있다. 날짜는 전부 `<input type="date">`이며 숫자 "며칠" 입력은 쓰지 않는다.
 5. **스타일 객체** `S`(하단)와 온보딩용 `O`, 애니메이션 문자열 `KEYFRAMES`, 색상 상수 `INK`/`PAPER`/`ACCENT`.
+   - `KEYFRAMES`는 애니메이션 말고도 **인라인 스타일로 못 쓰는 의사 클래스 규칙**을 담는다: `button:focus{outline:none}`(클릭 후 남는 포커스 흔적 제거)과 `button:focus-visible`(키보드 접근성 유지). 포커스 흔적이 다시 보이면 이 규칙부터 확인하고, 인라인으로 우회하지 마라.
 
 ## 핵심 도메인 규칙 (절대 훼손 금지)
 이 앱의 회계 로직은 특정하게 설계돼 있습니다. 건드릴 때 반드시 지키세요.
@@ -65,4 +70,5 @@ public/               PWA 아이콘(icon-192/512.png), favicon.svg
 - 진짜 OS 홈 위젯은 PWA로 불가(네이티브 필요). `public` 등에 위젯은 없음.
 - 데이터 백업은 JSON 내보내기/가져오기만 있음("이번 달" 탭 하단). CSV는 없음.
 - 백업 가져오기 직후에는 자동 월 마감이 다시 돌지 않음(해당 useEffect가 마운트 시 1회만 실행). 지난달 `lastYM`이 담긴 백업을 불러오면 그 달 마감은 다음 앱 실행 때 처리됨.
+- 뒤로가기는 iOS에서 하드웨어 버튼이 없어 스와이프 back에만 반응한다(오버레이 닫기·홈 이동까지만 동작하고 종료 안내는 뜨지 않음). 종료 안내가 뜬 뒤 2초 동안은 가드 엔트리가 없어, 그 사이에 모달을 열고 곧바로 back을 누르면 모달이 닫히는 대신 앱이 종료될 수 있음(실사용에서 거의 불가능한 타이밍이라 방치).
 - `cycleLabel()`은 `anchor`(첫 발생일)를 표시하지 않음. 목록에서는 "2주마다"까지만 보이고 언제부터인지는 수정 폼을 열어야 확인 가능.
